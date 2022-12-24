@@ -5,36 +5,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 )
 
-// Defines the interpretation of the "Payload data".  If an unknown
-// opcode is received, the receiving endpoint MUST Fail the
-// WebSocket Connection.
-type Opcode uint8
-
-// https://tools.ietf.org/html/rfc6455#section-11.8.
-const (
-	OpContinuation Opcode = iota
-	OpText
-	OpBinary
-	// 3 - 7 are reserved for further non-control frames.
-	_
-	_
-	_
-	_
-	_
-	OpClose
-	OpPing
-	OpPong
-	// 11-16 are reserved for further control frames.
-)
-
-// Header represents a WebSocket frame header.
-//
-// See https://tools.ietf.org/html/rfc6455#section-5.2.
+// Header represents a [WebSocket frame header].
 //
 //	0                   1                   2                   3
-//
 //	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 //	+-+-+-+-+-------+-+-------------+-------------------------------+
 //	|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
@@ -52,45 +28,62 @@ const (
 //	+ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
 //	|                     Payload Data continued ...                |
 //	+---------------------------------------------------------------+
+//
+// [WebSocket frame header]: https://tools.ietf.org/html/rfc6455#section-5.2.
 type Header struct {
 	firstByte byte
+	// All frames sent from the client to the server are masked by a
+	// 32-bit value that is contained within the frame.  This field is
+	// present if the mask bit is set to 1 and is absent if the mask bit
+	// is set to 0.  See Section 5.3 for further information on client-
+	// to-server masking.
+	Mask uint32 // A mask key of zero has no effect in XOR operations, thus zero value is no mask.
+
 	// Defines whether the "Payload data" is masked.  If set to 1, a
 	// masking key is present in masking-key, and this is used to unmask
 	// the "Payload data" as per Section 5.3.  All frames sent from
 	// client to server have this bit set to 1.
-	Masked bool
+	// Masked bool
 	// The length of the "Payload data", in bytes: if 0-125, that is the
 	// payload length.  If 126, the following 2 bytes interpreted as a
 	// 16-bit unsigned integer are the payload length.  If 127, the
 	// following 8 bytes interpreted as a 64-bit unsigned integer (the
 	// most significant bit MUST be 0) are the payload length.
 	PayloadLength uint64
-	// All frames sent from the client to the server are masked by a
-	// 32-bit value that is contained within the frame.  This field is
-	// present if the mask bit is set to 1 and is absent if the mask bit
-	// is set to 0.  See Section 5.3 for further information on client-
-	// to-server masking.
-	Mask uint32
 }
 
-// Opcode returns the header's operation code as per https://tools.ietf.org/html/rfc6455#section-11.8.
+// Defines the interpretation of the "Payload data".  If an unknown
+// opcode is received, the receiving endpoint MUST Fail the
+// WebSocket Connection.
+type Opcode uint8
+
+func (op Opcode) IsControl() bool { return op < maxOpcode && op&(1<<3) != 0 }
+
+// Opcode returns the header's operation code as per [section 11].
+//
+// [section 11]: https://tools.ietf.org/html/rfc6455#section-11.8.
 func (h Header) Opcode() Opcode {
 	return Opcode(h.firstByte & 0b1111)
 }
 
-func (h Header) Fin() bool  { return h.firstByte&(1<<7) != 0 }
-func (h Header) Rsv1() bool { return h.firstByte&(1<<6) != 0 }
-func (h Header) Rsv2() bool { return h.firstByte&(1<<5) != 0 }
-func (h Header) Rsv3() bool { return h.firstByte&(1<<4) != 0 }
+func (h Header) Masked() bool { return h.Mask != 0 }
+func (h Header) Fin() bool    { return h.firstByte&(1<<7) != 0 }
+func (h Header) Rsv1() bool   { return h.firstByte&(1<<6) != 0 }
+func (h Header) Rsv2() bool   { return h.firstByte&(1<<5) != 0 }
+func (h Header) Rsv3() bool   { return h.firstByte&(1<<4) != 0 }
 
-func NewHeader(op Opcode, payload int, fin, masked bool) (Header, error) {
+func NewHeader(op Opcode, payload, mask int, fin bool) (Header, error) {
 	if op > 0b1111 {
 		return Header{}, errors.New("invalid opcode")
 	}
 	if payload < 0 {
 		return Header{}, errors.New("negative payload length")
 	}
-	return Header{firstByte: byte(op) | b2u8(fin)<<7, Masked: masked, PayloadLength: uint64(payload)}, nil
+	if mask < 0 || mask > math.MaxUint32 {
+		return Header{}, errors.New("negative mask or mask exceeds 32bit unsigned integer range")
+	}
+
+	return Header{firstByte: byte(op) | b2u8(fin)<<7, Mask: uint32(mask), PayloadLength: uint64(payload)}, nil
 }
 
 func b2u8(b bool) uint8 {
@@ -100,35 +93,36 @@ func b2u8(b bool) uint8 {
 	return 0
 }
 
-func DecodeHeader(r io.Reader) (Header, error) {
+func DecodeHeader(r io.Reader) (Header, int, error) {
 	firstByte, err := decodeByte(r)
 	if err != nil {
-		return Header{}, err
+		return Header{}, 0, err
 	}
-	plen, masked, _, err := decodePayload(r)
+	plen, masked, n, err := decodePayload(r)
 	if err != nil {
-		return Header{}, err
+		return Header{}, n, err
 	}
 	h := Header{
 		firstByte:     firstByte,
-		Masked:        masked,
 		PayloadLength: plen,
 	}
 	if masked {
 		var buf [4]byte
-		_, err := readFull(r, buf[:4])
+		ngot, err := readFull(r, buf[:4])
+		n += ngot
 		if err != nil {
-			return Header{}, err
+			return Header{}, n, err
 		}
 		h.Mask = binary.BigEndian.Uint32(buf[:4])
 	}
-	return h, nil
+	return h, n, nil
 }
 
 func decodePayload(r io.Reader) (v uint64, masked bool, n int, err error) {
 	var buf [8]byte
 	n, err = r.Read(buf[:1]) // Read single byte
 	masked = buf[0]&(1<<7) != 0
+	buf[0] &^= (1 << 7) // Exclude mask bit from payload.
 	if err != nil {
 		if n == 0 {
 			return 0, masked, n, errors.New("unexpected 0 bytes read from buffer and no error returned")
