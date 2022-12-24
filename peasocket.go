@@ -1,9 +1,9 @@
 package peasocket
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 )
@@ -55,24 +55,30 @@ type Header struct {
 // Defines the interpretation of the "Payload data".  If an unknown
 // opcode is received, the receiving endpoint MUST Fail the
 // WebSocket Connection.
-type Opcode uint8
+type FrameType uint8
 
-func (op Opcode) IsControl() bool { return op < maxOpcode && op&(1<<3) != 0 }
+func (op FrameType) IsControl() bool { return op < maxOpcode && op&(1<<3) != 0 }
 
 // Opcode returns the header's operation code as per [section 11].
 //
 // [section 11]: https://tools.ietf.org/html/rfc6455#section-11.8.
-func (h Header) Opcode() Opcode {
-	return Opcode(h.firstByte & 0b1111)
+func (h Header) Opcode() FrameType {
+	return FrameType(h.firstByte & 0b1111)
 }
 
-func (h Header) Masked() bool { return h.Mask != 0 }
-func (h Header) Fin() bool    { return h.firstByte&(1<<7) != 0 }
-func (h Header) Rsv1() bool   { return h.firstByte&(1<<6) != 0 }
-func (h Header) Rsv2() bool   { return h.firstByte&(1<<5) != 0 }
-func (h Header) Rsv3() bool   { return h.firstByte&(1<<4) != 0 }
+func (h Header) IsMasked() bool { return h.Mask != 0 }
+func (h Header) Fin() bool      { return h.firstByte&(1<<7) != 0 }
+func (h Header) Rsv1() bool     { return h.firstByte&(1<<6) != 0 }
+func (h Header) Rsv2() bool     { return h.firstByte&(1<<5) != 0 }
+func (h Header) Rsv3() bool     { return h.firstByte&(1<<4) != 0 }
 
-func NewHeader(op Opcode, payload, mask int, fin bool) (Header, error) {
+func (h Header) String() string {
+	return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t  RSV:%v|%v|%v", h.Opcode().String(), h.Fin(), h.Rsv1(), h.Rsv2(), h.Rsv3(), h.PayloadLength)
+}
+
+// NewHeader creates a new websocket frame header. Set mask to 0 to disable masking
+// on the payload.
+func NewHeader(op FrameType, payload, mask int, fin bool) (Header, error) {
 	if op > 0b1111 {
 		return Header{}, errors.New("invalid opcode")
 	}
@@ -82,15 +88,11 @@ func NewHeader(op Opcode, payload, mask int, fin bool) (Header, error) {
 	if mask < 0 || mask > math.MaxUint32 {
 		return Header{}, errors.New("negative mask or mask exceeds 32bit unsigned integer range")
 	}
-
-	return Header{firstByte: byte(op) | b2u8(fin)<<7, Mask: uint32(mask), PayloadLength: uint64(payload)}, nil
+	return newHeader(op, uint64(payload), uint32(mask), fin), nil
 }
 
-func b2u8(b bool) uint8 {
-	if b {
-		return 1
-	}
-	return 0
+func newHeader(op FrameType, payload uint64, mask uint32, fin bool) Header {
+	return Header{firstByte: byte(op) | b2u8(fin)<<7, Mask: mask, PayloadLength: payload}
 }
 
 func DecodeHeader(r io.Reader) (Header, int, error) {
@@ -98,7 +100,8 @@ func DecodeHeader(r io.Reader) (Header, int, error) {
 	if err != nil {
 		return Header{}, 0, err
 	}
-	plen, masked, n, err := decodePayload(r)
+	plen, masked, n, err := decodePayloadLength(r)
+	n++ //add first byte
 	if err != nil {
 		return Header{}, n, err
 	}
@@ -118,7 +121,7 @@ func DecodeHeader(r io.Reader) (Header, int, error) {
 	return h, n, nil
 }
 
-func decodePayload(r io.Reader) (v uint64, masked bool, n int, err error) {
+func decodePayloadLength(r io.Reader) (v uint64, masked bool, n int, err error) {
 	var buf [8]byte
 	n, err = r.Read(buf[:1]) // Read single byte
 	masked = buf[0]&(1<<7) != 0
@@ -126,8 +129,9 @@ func decodePayload(r io.Reader) (v uint64, masked bool, n int, err error) {
 	if err != nil {
 		if n == 0 {
 			return 0, masked, n, errors.New("unexpected 0 bytes read from buffer and no error returned")
-		} else if n == 1 && errors.Is(err, io.EOF) {
-			return uint64(buf[0]), masked, n, nil
+		} else if n == 1 && errors.Is(err, io.EOF) && buf[0] == 0 {
+			// No payload. to read.
+			return 0, masked, n, nil
 		}
 		return 0, masked, n, err
 	}
@@ -152,28 +156,54 @@ func decodePayload(r io.Reader) (v uint64, masked bool, n int, err error) {
 	return v, masked, n, nil
 }
 
-func decodeByte(r io.Reader) (value byte, err error) {
-	var vbuf [1]byte
-	n, err := r.Read(vbuf[:])
-	if err != nil && n == 1 && errors.Is(err, io.EOF) {
-		err = nil // Byte was read successfully albeit with an EOF.
-	} else if n == 0 {
-		err = errors.New("unexpected 0 bytes read from buffer and no error returned")
+func (h *Header) Encode(w io.Writer) (int, error) {
+	err := encodeByte(w, h.firstByte)
+	if err != nil {
+		return 0, err
 	}
-	return vbuf[0], err
+	n, err := h.encodePayloadLength(w)
+	n++
+	if err != nil {
+		return n, err
+	}
+	if h.IsMasked() {
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:4], h.Mask)
+		ngot, err := writeFull(w, buf[:4])
+		n += ngot
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
-func readFull(src io.Reader, dst []byte) (int, error) {
-	n, err := src.Read(dst)
-	if err == nil && n != len(dst) {
-		var buffer [256]byte
-		// TODO(soypat): Avoid heavy heap allocation by implementing lightweight algorithm here.
-		i64, err := io.CopyBuffer(bytes.NewBuffer(dst[n:]), src, buffer[:])
-		i := int(i64)
-		if err != nil && errors.Is(err, io.EOF) && i == len(dst[n:]) {
-			err = nil
+func (h *Header) encodePayloadLength(w io.Writer) (n int, err error) {
+	var buf [8]byte
+	mask := b2u8(h.IsMasked()) << 7
+	pl := h.PayloadLength
+	switch {
+	case pl < 126:
+		buf[0] = mask | byte(pl)
+		n, err = w.Write(buf[:1])
+
+	case pl <= math.MaxUint16:
+		err = encodeByte(w, mask|126)
+		if err != nil {
+			return n, err
 		}
-		return n + i, err
+		n++
+		binary.BigEndian.PutUint16(buf[:2], uint16(pl))
+		n, err = writeFull(w, buf[:2])
+
+	default:
+		err = encodeByte(w, mask|127)
+		if err != nil {
+			return n, err
+		}
+		n++
+		binary.BigEndian.PutUint64(buf[:8], pl)
+		n, err = writeFull(w, buf[:8])
 	}
 	return n, err
 }

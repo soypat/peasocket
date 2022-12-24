@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("00")
+uint32(2721129524)

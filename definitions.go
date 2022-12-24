@@ -1,17 +1,21 @@
 package peasocket
 
 const (
-	// MaxControlPayload is the maximum length of a control frame payload.
-	// See https://tools.ietf.org/html/rfc6455#section-5.5.
+	// MaxControlPayload is the maximum length of a control frame payload as per [section 5.5].
+	//
+	// [section 5.5]: https://tools.ietf.org/html/rfc6455#section-5.5.
 	MaxControlPayload = 125
+	maxCloseReason    = MaxControlPayload - 2 // minus 2 to include 16 bit status code.
 	maxOpcode         = 0b1111
 )
 
-// Non control frame https://tools.ietf.org/html/rfc6455#section-11.8.
+// [Non-control frames].
+//
+// [Non-control frames]: https://tools.ietf.org/html/rfc6455#section-11.8.
 const (
-	OpContinuation Opcode = iota
-	OpText
-	OpBinary
+	FrameContinuation FrameType = iota
+	FrameText
+	FrameBinary
 	// 3 - 7 are reserved for further non-control frames.
 	_
 	_
@@ -21,25 +25,27 @@ const (
 	_numNCFrames
 )
 
-// Control frames https://tools.ietf.org/html/rfc6455#section-11.8.
+// [Control frames].
+//
+// [Control frames]: https://tools.ietf.org/html/rfc6455#section-11.8
 const (
-	OpClose Opcode = iota + _numNCFrames
-	// A Ping frame may serve either as a keepalive or as a means to verify that
+	FrameClose FrameType = iota + _numNCFrames
+	// A Ping control frame may serve either as a keepalive or as a means to verify that
 	// the remote endpoint is still responsive.
 	// An endpoint MAY send a Ping frame any time after the connection is
 	// established and before the connection is closed.
-	OpPing
-	// A Pong frame sent in response to a Ping frame must have identical
+	FramePing
+	// A Pong control frame sent in response to a Ping frame must have identical
 	// "Application data" as found in the message body of the Ping frame
 	// being replied to.
-	OpPong
+	FramePong
 	// 11-16 are reserved for further control frames.
 )
 
 // StatusCode represents a [WebSocket status code].
 //
 // [WebSocket status code]: https://tools.ietf.org/html/rfc6455#section-7.4
-type StatusCode int
+type StatusCode uint16
 
 // These are only the [status codes defined by the protocol].
 //
@@ -116,6 +122,32 @@ func (sc StatusCode) String() (s string) {
 		s = "TLS handshake"
 	default:
 		s = "unknown websocket status code"
+	}
+	return s
+}
+
+func (ft FrameType) String() (s string) {
+	switch ft {
+	case FrameContinuation:
+		s = "continuation"
+	case FrameText:
+		s = "text"
+	case FrameBinary:
+		s = "binary"
+	case FrameClose:
+		s = "connection close"
+	case FramePing:
+		s = "ping"
+	case FramePong:
+		s = "pong"
+	default:
+		if ft >= 16 {
+			s = "invalid frame opcode value"
+		} else if ft >= 7 {
+			s = "reserved ctl"
+		} else {
+			s = "reserved non-ctl"
+		}
 	}
 	return s
 }

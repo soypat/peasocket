@@ -1,6 +1,7 @@
 package peasocket
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -20,11 +21,10 @@ type RxCallbacks struct {
 	// OnError executed when a decoding error is encountered after
 	// consuming a non-zero amoung of bytes from the underlying transport.
 	// If this callback is set then it becomes the responsability of the callback
-	// to close the underlying transport. The Websocket connection must be closed after
-	//
-	OnError   func(*Rx, error)
-	OnCtl     func(*Rx, io.Reader) error
-	OnPayload func(*Rx, io.Reader) error
+	// to close the underlying transport.
+	OnError   func(rx *Rx, err error)
+	OnCtl     func(rx *Rx, r io.Reader) error
+	OnPayload func(rx *Rx, r io.Reader) error
 }
 
 func (rx *Rx) ReadNextFrame() (int, error) {
@@ -44,7 +44,7 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 	if isCtl {
 		if !isFin {
 			err = errors.New("control frame needs FIN bit set")
-		} else if h.PayloadLength > 255 {
+		} else if h.PayloadLength > MaxControlPayload {
 			err = errors.New("payload too large for control frame (>255)")
 		}
 	}
@@ -53,7 +53,7 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 		return n, err
 	}
 	// Wrap reader to limit to payload length and unmask the received bytes if payload is masked.
-	if h.Masked() {
+	if h.IsMasked() {
 		reader = newMaskedReader(reader, h.Mask)
 	}
 	lr := &io.LimitedReader{R: reader, N: int64(h.PayloadLength)}
@@ -74,7 +74,7 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 	if err != nil {
 		rx.handleErr(err)
 	}
-	return n, err
+	return n + int(h.PayloadLength-uint64(lr.N)), err
 }
 
 func (rx *Rx) handleErr(err error) {
@@ -83,6 +83,127 @@ func (rx *Rx) handleErr(err error) {
 		return
 	}
 	rx.trp.Close()
+}
+
+type TxBuffered struct {
+	buf         bytes.Buffer
+	trp         io.WriteCloser
+	TxCallbacks TxCallbacks
+}
+
+type TxCallbacks struct {
+	OnError func(tx *TxBuffered, err error)
+}
+
+// WriteTextMessage writes an UTF-8 encoded message over the transport.
+// This implementation does not check if payload is valid UTF-8. This can be done
+// with the unicode/utf8 Valid function.
+// payload's bytes will be masked and thus mutated if mask is non-zero.
+func (tx *TxBuffered) WriteTextMessage(mask uint32, payload []byte) (int, error) {
+	return tx.writeMessage(mask, payload, true)
+}
+
+// WriteTextMessage writes an arbitrary message over the transport.
+// payload's bytes will be masked and thus mutated if mask is non-zero.
+func (tx *TxBuffered) WriteMessage(mask uint32, payload []byte) (int, error) {
+	return tx.writeMessage(mask, payload, false)
+}
+
+func (tx *TxBuffered) writeMessage(mask uint32, payload []byte, isUTF8 bool) (int, error) {
+	frameType := FrameBinary
+	if isUTF8 {
+		frameType = FrameText
+	}
+	tx.buf.Reset()
+	h := newHeader(frameType, uint64(len(payload)), mask, true)
+	_, err := h.Encode(&tx.buf)
+	if err != nil {
+		return 0, err
+	}
+	if h.IsMasked() {
+		_ = maskWS(mask, payload)
+	}
+	_, err = tx.buf.Write(payload)
+	if err != nil {
+		return 0, err
+	}
+	n, err := tx.buf.WriteTo(tx.trp)
+	if err != nil && n > 0 {
+		tx.handleError(err)
+	}
+	return int(n), err
+}
+
+func (tx *TxBuffered) handleError(err error) {
+	if tx.TxCallbacks.OnError != nil {
+		tx.TxCallbacks.OnError(tx, err)
+		return
+	}
+	tx.trp.Close()
+}
+
+// WriteClose writes a Close frame over the websocket connection. reason will be mutated
+// if mask is non-zero.
+func (tx *TxBuffered) WriteClose(mask uint32, status StatusCode, reason []byte) (int, error) {
+	if len(reason) > maxCloseReason {
+		return 0, errors.New("close reason too long. must be under 123 bytes")
+	}
+	tx.buf.Reset()
+	pl := uint64(2 + len(reason))
+	h := newHeader(FrameClose, pl, mask, true)
+	_, err := h.Encode(&tx.buf)
+	if err != nil {
+		return 0, err
+	}
+	var codebuf [2]byte
+	if h.IsMasked() {
+		mask = maskWS(mask, codebuf[:])
+	}
+	binary.BigEndian.PutUint16(codebuf[:], uint16(status))
+	_, err = tx.buf.Write(codebuf[:2])
+	if err != nil {
+		return 0, err
+	}
+	if h.IsMasked() {
+		_ = maskWS(mask, reason)
+	}
+	_, err = writeFull(&tx.buf, reason)
+	if err != nil {
+		return 0, err
+	}
+	n, err := tx.buf.WriteTo(tx.trp)
+	if err != nil && n > 0 {
+		tx.handleError(err)
+	}
+	return int(n), err
+}
+
+func (tx *TxBuffered) WritePing(mask uint32, message []byte) (int, error) {
+	if len(message) > MaxControlPayload {
+		return 0, errors.New("ping message too long, must be under 125 bytes")
+	}
+	if mask == 0 {
+		return 0, errors.New("pings require a non-zero mask")
+	}
+	tx.buf.Reset()
+	pl := uint64(len(message))
+	h := newHeader(FramePing, pl, mask, true)
+	_, err := h.Encode(&tx.buf)
+	if err != nil {
+		return 0, err
+	}
+	if h.IsMasked() {
+		_ = maskWS(mask, message)
+	}
+	_, err = writeFull(&tx.buf, message)
+	if err != nil {
+		return 0, err
+	}
+	n, err := tx.buf.WriteTo(tx.trp)
+	if err != nil && n > 0 {
+		tx.handleError(err)
+	}
+	return int(n), err
 }
 
 // newMaskedReader creates a new MaskedReader ready for use.
@@ -105,8 +226,44 @@ func (mr *maskedReader) Read(b []byte) (int, error) {
 	if lenRead == 0 {
 		return 0, err
 	}
-	key := mr.MaskKey
-	b = b[:lenRead]
+	mr.MaskKey = maskWS(mr.MaskKey, b[:lenRead])
+	return lenRead, nil
+}
+
+// newMaskedReader creates a new MaskedReader ready for use.
+func newMaskedWriter(r io.Writer, maskKey uint32) *maskedWriter {
+	return &maskedWriter{W: r, MaskKey: maskKey}
+}
+
+// maskedReader applies the [WebSocket masking algorithm]
+// to the underlying reader.
+//
+// [WebSocket masking algorithm]: https://tools.ietf.org/html/rfc6455#section-5.3
+type maskedWriter struct {
+	W       io.Writer
+	MaskKey uint32
+}
+
+// Write implements the [io.Writer] interface for the websocket masking algorithm.
+// TODO(soypat): find out if the copy is necessary or can be avoided. io.Writer's
+// arguments can be used as scratch space by caller however this may not be true in practice.
+func (mr *maskedWriter) Write(b []byte) (n int, err error) {
+	var staticbuf [256]byte
+	for len(b) != 0 {
+		towrite := copy(staticbuf[:], b)
+		buf := staticbuf[:towrite]
+		mr.MaskKey = maskWS(mr.MaskKey, buf)
+		ngot, err := writeFull(mr.W, buf)
+		n += ngot
+		if err != nil {
+			return n, err
+		}
+		b = b[towrite:]
+	}
+	return n, nil
+}
+
+func maskWS(key uint32, b []byte) uint32 {
 	for len(b) >= 4 {
 		v := binary.LittleEndian.Uint32(b)
 		binary.LittleEndian.PutUint32(b, v^key)
@@ -119,8 +276,6 @@ func (mr *maskedReader) Read(b []byte) (int, error) {
 			b[i] ^= byte(key)
 			key = bits.RotateLeft32(key, -8)
 		}
-		mr.MaskKey = key
 	}
-
-	return lenRead, nil
+	return key
 }
