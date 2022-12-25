@@ -11,15 +11,19 @@ import (
 )
 
 func ExampleClient() {
-	const message = "hello world!"
+	const (
+		message = "Hello!"
+	)
 	mask := uint32(time.Now().UnixMilli())
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+
 	defer cancel()
-	client := peasocket.NewClient("ws://localhost:1883")
+	client := peasocket.NewClient("ws://localhost:8080")
 	err := client.DialHandshake(ctx, nil)
 	if err != nil {
 		log.Fatal("while dialing:", err)
 	}
+	log.Printf("protocol switch success. prepare msg=%q with mask %#X", message, mask)
 	_, err = client.Tx.WritePing(mask, []byte(message))
 	if err != nil {
 		log.Fatal("while pinging:", err)

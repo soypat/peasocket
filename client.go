@@ -15,25 +15,25 @@ import (
 	"unsafe"
 )
 
-func NewClient(url string) *Client {
+func NewClient(serverURL string) *Client {
 	c := &Client{
-		url: url,
+		serverURL: serverURL,
 	}
 	return c
 }
 
 type Client struct {
-	url     string
-	entropy func() uint32
-	Rx      Rx
-	Tx      TxBuffered
+	serverURL string
+	entropy   func() uint32
+	Rx        Rx
+	Tx        TxBuffered
 }
 
 func (c *Client) DialHandshake(ctx context.Context, overwriteHeaders http.Header) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
-	u, err := url.Parse(c.url)
+	u, err := url.Parse(c.serverURL)
 	if err != nil {
 		return err
 	}

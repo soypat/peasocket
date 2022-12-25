@@ -73,7 +73,11 @@ func (h Header) Rsv2() bool     { return h.firstByte&(1<<5) != 0 }
 func (h Header) Rsv3() bool     { return h.firstByte&(1<<4) != 0 }
 
 func (h Header) String() string {
-	return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t  RSV:%v|%v|%v", h.Opcode().String(), h.Fin(), h.Rsv1(), h.Rsv2(), h.Rsv3(), h.PayloadLength)
+	fin, rsv1, rsv2, rsv3 := h.Fin(), h.Rsv1(), h.Rsv2(), h.Rsv3()
+	if rsv1 || rsv2 || rsv3 {
+		return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t  RSV:%v|%v|%v", h.Opcode().String(), h.PayloadLength, fin, rsv1, rsv2, rsv3)
+	}
+	return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t", h.Opcode().String(), h.PayloadLength, fin)
 }
 
 // NewHeader creates a new websocket frame header. Set mask to 0 to disable masking

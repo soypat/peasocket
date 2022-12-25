@@ -232,16 +232,16 @@ func (mr *maskedReader) Read(b []byte) (int, error) {
 
 func maskWS(key uint32, b []byte) uint32 {
 	for len(b) >= 4 {
-		v := binary.LittleEndian.Uint32(b)
-		binary.LittleEndian.PutUint32(b, v^key)
+		v := binary.BigEndian.Uint32(b)
+		binary.BigEndian.PutUint32(b, v^key)
 		b = b[4:]
 	}
 
 	if len(b) != 0 {
 		// xor remaining bytes and shift mask.
 		for i := range b {
-			b[i] ^= byte(key)
-			key = bits.RotateLeft32(key, -8)
+			b[i] ^= byte(key >> 24)
+			key = bits.RotateLeft32(key, 8)
 		}
 	}
 	return key
