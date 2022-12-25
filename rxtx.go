@@ -230,39 +230,6 @@ func (mr *maskedReader) Read(b []byte) (int, error) {
 	return lenRead, nil
 }
 
-// newMaskedReader creates a new MaskedReader ready for use.
-func newMaskedWriter(r io.Writer, maskKey uint32) *maskedWriter {
-	return &maskedWriter{W: r, MaskKey: maskKey}
-}
-
-// maskedReader applies the [WebSocket masking algorithm]
-// to the underlying reader.
-//
-// [WebSocket masking algorithm]: https://tools.ietf.org/html/rfc6455#section-5.3
-type maskedWriter struct {
-	W       io.Writer
-	MaskKey uint32
-}
-
-// Write implements the [io.Writer] interface for the websocket masking algorithm.
-// TODO(soypat): find out if the copy is necessary or can be avoided. io.Writer's
-// arguments can be used as scratch space by caller however this may not be true in practice.
-func (mr *maskedWriter) Write(b []byte) (n int, err error) {
-	var staticbuf [256]byte
-	for len(b) != 0 {
-		towrite := copy(staticbuf[:], b)
-		buf := staticbuf[:towrite]
-		mr.MaskKey = maskWS(mr.MaskKey, buf)
-		ngot, err := writeFull(mr.W, buf)
-		n += ngot
-		if err != nil {
-			return n, err
-		}
-		b = b[towrite:]
-	}
-	return n, nil
-}
-
 func maskWS(key uint32, b []byte) uint32 {
 	for len(b) >= 4 {
 		v := binary.LittleEndian.Uint32(b)

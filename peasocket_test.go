@@ -18,6 +18,7 @@ func FuzzMaskedReader(f *testing.F) {
 		maskKey uint32
 	}{
 		{data: []byte("asd\x00ASd\xff\xf0"), maskKey: 0xa2312434},
+		{data: []byte("asd\x00ASd\xff\xf0"), maskKey: 0},
 	}
 	for _, tc := range testCases {
 		f.Add(tc.data, tc.maskKey)
@@ -64,6 +65,7 @@ func FuzzLoopbackMessage(f *testing.F) {
 		maskKey uint32
 	}{
 		{data: []byte("asd\x00ASd\xff\xf0"), maskKey: 0xa2312434},
+		{data: []byte("asd\x00ASd\xff\xf0"), maskKey: 0},
 	}
 	for _, tc := range testCases {
 		f.Add(tc.data, tc.maskKey)
