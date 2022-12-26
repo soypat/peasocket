@@ -1,6 +1,8 @@
 package peasocket
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
@@ -9,33 +11,124 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
-func NewClient(serverURL string) *Client {
+// NewClient creates a new Client ready to connect to a websocket enabled server.
+// serverURL can start with wss:// or ws:// to enable TLS (secure websocket protocol).
+// entropy is a function that returns randomized 32 bit integers from a high-entropy source.
+// If entropy is nil then a default will be used.
+func NewClient(serverURL string, entropy func() uint32) *Client {
+	if entropy == nil {
+		entropy = defaultEntropy
+	}
+
 	c := &Client{
 		serverURL: serverURL,
+		entropy:   entropy,
+		state: clientState{
+			closed:             true,
+			pendingPingOrClose: make([]byte, 0, MaxControlPayload),
+			pendingPong:        make([]byte, 0, MaxControlPayload),
+		},
 	}
+	rxc, txc := c.callbacks()
+	c.Rx.RxCallbacks = rxc
+	c.Tx.TxCallbacks = txc
 	return c
 }
 
+// Client is a client websocket implementation.
 type Client struct {
-	serverURL string
-	entropy   func() uint32
 	Rx        Rx
 	Tx        TxBuffered
+	serverURL string
+	// entropy is assured to be defined after the first websocket connection.
+	entropy func() uint32
+
+	state clientState
 }
 
-func (c *Client) DialHandshake(ctx context.Context, overwriteHeaders http.Header) error {
+// Dial not yet tested. Performs websocket handshake over net.Conn.
+func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
+	secureWebsocketKey := c.secureKeyString()
+	req, err := c.makeRequest(context.Background(), secureWebsocketKey, overwriteHeaders)
+	if err != nil {
+		return err
+	}
+	err = req.Write(conn) // Write HTTP/1.1 request with challenge.
+	if err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReaderSize(conn, 1024), req)
+	if err != nil {
+		return err
+	}
+	if err := validateServerResponse(resp, secureWebsocketKey); err != nil {
+		return err
+	}
+	c.Tx.SetTxTransport(conn)
+	c.Rx.SetRxTransport(conn)
+	return nil
+}
+
+// DialViaHTTPClient completes a websocket handshake and returns an error if
+// the handshake failed. After a successful handshake the Client is ready to begin
+// communicating with the server via websocket protocol.
+func (c *Client) DialViaHTTPClient(ctx context.Context, overwriteHeaders http.Header) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
-	u, err := url.Parse(c.serverURL)
+	secureWebsocketKey := c.secureKeyString()
+	req, err := c.makeRequest(ctx, secureWebsocketKey, overwriteHeaders)
 	if err != nil {
 		return err
+	}
+	client := http.DefaultClient
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed handshake GET: %w", err)
+	}
+	if err := validateServerResponse(resp, secureWebsocketKey); err != nil {
+		return err
+	}
+
+	// TODO(soypat): use net.Conn instead.
+	rwc, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok {
+		return fmt.Errorf("response body not an io.ReadWriteCloser: %T", resp.Body)
+	}
+	c.Tx.SetTxTransport(rwc)
+	c.Rx.SetRxTransport(rwc)
+	return nil
+}
+
+// ReadNextFrame reads next frame in connection. Should be called in a loop
+func (c *Client) ReadNextFrame() error {
+	if c.state.IsClosed() {
+		return net.ErrClosed
+	}
+	_, err := c.Rx.ReadNextFrame()
+	return err
+}
+
+// NextMessageReader returns a reader to a complete websocket message.
+// This message may have been fragmented over the wire.
+func (c *Client) NextMessageReader() (io.Reader, error) {
+	return c.state.NextMessage()
+}
+
+// makeRequest creates the HTTP handshake required to initiate a websocket connection
+// with a server.
+func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, overwriteHeaders http.Header) (*http.Request, error) {
+	u, err := url.Parse(c.serverURL)
+	if err != nil {
+		return nil, err
 	}
 	switch u.Scheme {
 	case "ws":
@@ -44,46 +137,61 @@ func (c *Client) DialHandshake(ctx context.Context, overwriteHeaders http.Header
 		u.Scheme = "https"
 	case "http", "https":
 	default:
-		return fmt.Errorf("unexpected url scheme: %q", u.Scheme)
-	}
-	if c.entropy == nil {
-		c.entropy = defaultEntropy
+		return nil, fmt.Errorf("unexpected url scheme: %q", u.Scheme)
 	}
 
-	client := http.DefaultClient
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	req.Header.Set("Sec-WebSocket-Version", "13")
+	req := &http.Request{
+		Method:     http.MethodGet,
+		URL:        u,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Host:       u.Host,
+	}
+	req = req.WithContext(ctx)
+	req.Header["Upgrade"] = []string{"websocket"}
+	req.Header["Connection"] = []string{"Upgrade"}
+	req.Header["Sec-WebSocket-Version"] = []string{"13"}
 	for k, v := range overwriteHeaders {
 		if len(v) == 0 {
-			return errors.New("overwrite header key " + k + " empty")
+			return nil, errors.New("overwrite header key " + k + " empty")
 		}
 		req.Header.Set(k, v[0])
 		for _, v0 := range v[1:] {
 			req.Header.Add(k, v0)
 		}
 	}
-	entropyData := c.secureKey()
-	secureWebsocketKey := base64.StdEncoding.EncodeToString(entropyData[:])
-	req.Header.Set("Sec-WebSocket-Key", secureWebsocketKey)
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed handshake GET: %w", err)
+	req.Header["Sec-WebSocket-Key"] = []string{secureWebsocketKey}
+	return req, nil
+}
+
+// CloseConn closes the underlying transport without sending websocket frames.
+func (c *Client) CloseConn() error {
+	w := c.Tx.trp
+	if c.state.IsClosed() {
+		return errors.New("no websocket connection to close")
 	}
-	if err := validateServerResponse(resp, secureWebsocketKey); err != nil {
+	c.state.mu.Lock()
+	c.state.closed = true
+	c.state.mu.Unlock()
+	return w.Close()
+}
+
+// CloseWebsocket sends a close control frame over the websocket connection. Does
+// not close the underlying transport.
+func (c *Client) CloseWebsocket(status StatusCode, reason string) error {
+	if c.state.IsClosed() {
+		return errors.New("no websocket connection to close")
+	}
+
+	_, err := c.Tx.WriteClose(c.entropy(), status, []byte(reason))
+	if err != nil {
 		return err
 	}
-	rwc, ok := resp.Body.(io.ReadWriteCloser)
-	if !ok {
-		return fmt.Errorf("response body not an io.ReadWriteCloser: %T", resp.Body)
-	}
-	c.Tx = TxBuffered{
-		trp: rwc,
-	}
-	c.Rx = Rx{
-		trp: rwc,
-	}
+	c.state.mu.Lock()
+	c.state.closed = true
+	c.state.mu.Unlock()
 	return nil
 }
 
@@ -129,8 +237,143 @@ func serverProofOfReceipt(clientSecureWSKey string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
+func (c *Client) secureKeyString() string {
+	key := c.secureKey()
+	return base64.StdEncoding.EncodeToString(key[:])
+}
+
 func (c *Client) secureKey() [16]byte {
 	const u32size = unsafe.Sizeof(uint32(0))
 	k32 := [4]uint32{c.entropy(), c.entropy(), c.entropy(), c.entropy()}
 	return *(*[4 * u32size]byte)(unsafe.Pointer(&k32))
+}
+
+// TODO(soypat): add this to callbacks.
+func (c *Client) callbacks() (RxCallbacks, TxCallbacks) {
+	return RxCallbacks{
+			OnMessage: func(rx *Rx, message io.Reader) error {
+				c.state.mu.Lock()
+				defer c.state.mu.Unlock()
+				n, err := io.Copy(&c.state.rbuf, message)
+				if err != nil {
+					c.state.currentMessageSize = 0
+					return err
+				}
+				c.state.currentMessageSize += uint64(n)
+				if rx.LastReceivedHeader.Fin() {
+					c.state.messageSizes = append(c.state.messageSizes, c.state.currentMessageSize)
+					c.state.currentMessageSize = 0
+				}
+				return nil
+			},
+			OnCtl: func(rx *Rx, payload io.Reader) (err error) {
+				op := rx.LastReceivedHeader.FrameType()
+				c.state.mu.Lock()
+				defer c.state.mu.Unlock()
+				var n int
+				switch op {
+				case FramePing:
+					n, err = readFull(payload, c.state.pendingPingOrClose[:MaxControlPayload])
+					if err != nil {
+						break
+					}
+					// Replaces pending ping with new ping.
+					c.state.pendingPingOrClose = c.state.pendingPingOrClose[:n]
+
+				case FramePong:
+					n, err = readFull(payload, c.state.pendingPingOrClose[:MaxControlPayload])
+					if err != nil {
+						break
+					}
+					c.state.pendingPong = c.state.pendingPingOrClose[:n]
+
+				case FrameClose:
+					c.state.closed = true
+					n, err = readFull(payload, c.state.pendingPingOrClose[:MaxControlPayload])
+					if err != nil {
+						break
+					}
+					// Replaces pending ping with new ping.
+					c.state.pendingPingOrClose = c.state.pendingPingOrClose[:n]
+				default:
+					panic("unknown control FrameType") // This should be unreachable.
+				}
+				return err
+			},
+			OnError: func(rx *Rx, err error) {
+				c.CloseConn()
+			},
+		}, TxCallbacks{
+			OnError: func(tx *TxBuffered, err error) {
+				c.CloseConn()
+			},
+		}
+}
+
+// clientState stores the persisting state of a websocket client connection.
+// Since this state is shared between frames it is protected by a mutex so that
+// the Client implementation is concurrent-safe.
+type clientState struct {
+	mu                 sync.Mutex
+	rbuf               bytes.Buffer
+	currentMessageSize uint64
+	// unused as of yet.
+	messageSizes []uint64
+	// These two slices point to buf*
+	pendingPingOrClose []byte
+	pendingPong        []byte
+	closed             bool
+}
+
+func (cs *clientState) PendingAction() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return !cs.closed && cs.pendingPingOrClose != nil
+}
+
+func (cs *clientState) IsClosed() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.closed
+}
+
+func (cs *clientState) GetServerClosedReason() (_ StatusCode, reason []byte) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if !cs.closed || len(cs.pendingPingOrClose) < 2 {
+		return 0, nil
+	}
+	sc := StatusCode(binary.BigEndian.Uint16(cs.pendingPingOrClose[:2]))
+	return sc, cs.pendingPingOrClose[2:]
+}
+
+func (cs *clientState) Buffered() int {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.rbuf.Len()
+}
+
+// func (cs *clientState) ReadRx(b []byte) (int, error) {
+// 	cs.mu.Lock()
+// 	defer cs.mu.Unlock()
+
+// 	n, err := cs.rbuf.Read(b)
+// }
+
+func (cs *clientState) NextMessage() (io.Reader, error) {
+	buffered := cs.Buffered()
+	if buffered == 0 || len(cs.messageSizes) == 0 {
+		return nil, errors.New("no messages in buffer")
+	}
+	size := cs.messageSizes[0]
+	cs.messageSizes = cs.messageSizes[1:]
+	if len(cs.messageSizes) == 0 {
+		cs.messageSizes = nil
+	}
+	var newbuf bytes.Buffer
+	_, err := io.Copy(&newbuf, io.LimitReader(&cs.rbuf, int64(size)))
+	if err != nil {
+		panic(err) // should be unreachable.
+	}
+	return &newbuf, nil
 }

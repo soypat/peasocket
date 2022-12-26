@@ -57,27 +57,40 @@ type Header struct {
 // WebSocket Connection.
 type FrameType uint8
 
-func (op FrameType) IsControl() bool { return op < maxOpcode && op&(1<<3) != 0 }
+// IsControl returns true if the frame is valid and is a control frame (ping, pong or close).
+func (op FrameType) IsControl() bool { return op <= maxOpcode && op&(1<<3) != 0 }
 
-// Opcode returns the header's operation code as per [section 11].
+// FrameType returns the header's operation code as per [section 11].
 //
 // [section 11]: https://tools.ietf.org/html/rfc6455#section-11.8.
-func (h Header) Opcode() FrameType {
+func (h Header) FrameType() FrameType {
 	return FrameType(h.firstByte & 0b1111)
 }
 
+// IsMasked returns true if payload is masked.
 func (h Header) IsMasked() bool { return h.Mask != 0 }
-func (h Header) Fin() bool      { return h.firstByte&(1<<7) != 0 }
-func (h Header) Rsv1() bool     { return h.firstByte&(1<<6) != 0 }
-func (h Header) Rsv2() bool     { return h.firstByte&(1<<5) != 0 }
-func (h Header) Rsv3() bool     { return h.firstByte&(1<<4) != 0 }
 
+// Fin returns true if the FIN bit in the frame header is set. Always should be set for control frames.
+func (h Header) Fin() bool { return h.firstByte&(1<<7) != 0 }
+
+// Rsv1 returns true if the first frame header reserved bit is set. Used for extensions.
+func (h Header) Rsv1() bool { return h.firstByte&(1<<6) != 0 }
+
+// Rsv2 returns true if the second frame header reserved bit is set. Used for extensions.
+func (h Header) Rsv2() bool { return h.firstByte&(1<<5) != 0 }
+
+// Rsv3 returns true if the third frame header reserved bit is set. Used for extensions.
+func (h Header) Rsv3() bool { return h.firstByte&(1<<4) != 0 }
+
+// String returns a human readable representation of the Frame header in the following format:
+//
+//	Frame:<frame type> (payload=<payload length decimal>) FIN:<true|false> <RSV if set>
 func (h Header) String() string {
 	fin, rsv1, rsv2, rsv3 := h.Fin(), h.Rsv1(), h.Rsv2(), h.Rsv3()
 	if rsv1 || rsv2 || rsv3 {
-		return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t  RSV:%v|%v|%v", h.Opcode().String(), h.PayloadLength, fin, rsv1, rsv2, rsv3)
+		return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t  RSV:%v|%v|%v", h.FrameType().String(), h.PayloadLength, fin, rsv1, rsv2, rsv3)
 	}
-	return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t", h.Opcode().String(), h.PayloadLength, fin)
+	return fmt.Sprintf("Frame:%v (payload=%v) FIN:%t", h.FrameType().String(), h.PayloadLength, fin)
 }
 
 // NewHeader creates a new websocket frame header. Set mask to 0 to disable masking
@@ -95,10 +108,13 @@ func NewHeader(op FrameType, payload, mask int, fin bool) (Header, error) {
 	return newHeader(op, uint64(payload), uint32(mask), fin), nil
 }
 
+// newHeader is a convenience function for easily creating Headers skipping the validation step.
 func newHeader(op FrameType, payload uint64, mask uint32, fin bool) Header {
 	return Header{firstByte: byte(op) | b2u8(fin)<<7, Mask: mask, PayloadLength: payload}
 }
 
+// DecodeHeader reads a header from the io.Reader. It assumes the first byte corresponds
+// to the header's first byte.
 func DecodeHeader(r io.Reader) (Header, int, error) {
 	firstByte, err := decodeByte(r)
 	if err != nil {
@@ -160,6 +176,8 @@ func decodePayloadLength(r io.Reader) (v uint64, masked bool, n int, err error) 
 	return v, masked, n, nil
 }
 
+// Encode writes the websocket header to w as it would be sent over the wire.
+// It does not encode a payload.
 func (h *Header) Encode(w io.Writer) (int, error) {
 	err := encodeByte(w, h.firstByte)
 	if err != nil {

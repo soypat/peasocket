@@ -11,6 +11,7 @@ import (
 // rxtx.go will contain basic frame marshalling and unmarshalling logic
 // agnostic to the data being sent and the websocket control flow.
 
+// Rx provides a way to handle a Websocket transport.
 type Rx struct {
 	LastReceivedHeader Header
 	trp                io.ReadCloser
@@ -22,11 +23,27 @@ type RxCallbacks struct {
 	// consuming a non-zero amoung of bytes from the underlying transport.
 	// If this callback is set then it becomes the responsability of the callback
 	// to close the underlying transport.
-	OnError   func(rx *Rx, err error)
-	OnCtl     func(rx *Rx, r io.Reader) error
-	OnPayload func(rx *Rx, r io.Reader) error
+	OnError func(rx *Rx, err error)
+
+	// If OnCtl is not nil then this is executed on every control frame received.
+	// These may or may not have a payload that can be readily read from r.
+	OnCtl func(rx *Rx, payload io.Reader) error
+	// If OnMessage is not nil it is called on the Rx for every application
+	// message received (non-control frames).
+	// The Application Message is contained in message which will return EOF
+	// when the whole payload has been read.
+	// The payload bytes are unmasked unless unmasking explicitly disabled on the Rx.
+	OnMessage func(rx *Rx, message io.Reader) error
 }
 
+// SetRxTransport sets the underlying transport of rx.
+func (rx *Rx) SetRxTransport(rc io.ReadCloser) {
+	rx.trp = rc
+}
+
+// ReadNextFrame reads a frame from the underlying transport of rx.
+// This method is meant to be used after setting the rx's callbacks.
+// If the callback is not set then the payload data will be read and discarded.
 func (rx *Rx) ReadNextFrame() (int, error) {
 	var reader io.Reader = rx.trp
 	h, n, err := DecodeHeader(reader)
@@ -38,7 +55,7 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 	}
 	rx.LastReceivedHeader = h
 	// Perform basic frame validation.
-	op := h.Opcode()
+	op := h.FrameType()
 	isFin := h.Fin()
 	isCtl := op.IsControl()
 	if isCtl {
@@ -59,8 +76,8 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 	lr := &io.LimitedReader{R: reader, N: int64(h.PayloadLength)}
 	if isCtl && rx.RxCallbacks.OnCtl != nil {
 		err = rx.RxCallbacks.OnCtl(rx, lr)
-	} else if rx.RxCallbacks.OnPayload != nil {
-		err = rx.RxCallbacks.OnPayload(rx, lr)
+	} else if rx.RxCallbacks.OnMessage != nil {
+		err = rx.RxCallbacks.OnMessage(rx, lr)
 	} else {
 		// No callback to handle message, we discard data.
 		var discard [256]byte
@@ -85,12 +102,24 @@ func (rx *Rx) handleErr(err error) {
 	rx.trp.Close()
 }
 
+// TxBuffered handles the marshalling of frames over a underlying transport.
 type TxBuffered struct {
 	buf         bytes.Buffer
 	trp         io.WriteCloser
 	TxCallbacks TxCallbacks
 }
 
+// NewTxBuffered creates a new TxBuffered ready for use.
+func NewTxBuffered(wc io.WriteCloser) *TxBuffered {
+	return &TxBuffered{trp: wc}
+}
+
+// SetTxTransport sets the underlying TxBuffered transport writer.
+func (tx *TxBuffered) SetTxTransport(wc io.WriteCloser) {
+	tx.trp = wc
+}
+
+// TxCallbacks stores functions to be called on events during marshalling of websocket frames.
 type TxCallbacks struct {
 	OnError func(tx *TxBuffered, err error)
 }
@@ -156,10 +185,10 @@ func (tx *TxBuffered) WriteClose(mask uint32, status StatusCode, reason []byte) 
 		return 0, err
 	}
 	var codebuf [2]byte
+	binary.BigEndian.PutUint16(codebuf[:], uint16(status))
 	if h.IsMasked() {
 		mask = maskWS(mask, codebuf[:])
 	}
-	binary.BigEndian.PutUint16(codebuf[:], uint16(status))
 	_, err = tx.buf.Write(codebuf[:2])
 	if err != nil {
 		return 0, err
@@ -178,6 +207,15 @@ func (tx *TxBuffered) WriteClose(mask uint32, status StatusCode, reason []byte) 
 	return int(n), err
 }
 
+// WritePong writes a pong message over the Tx.
+func (tx *TxBuffered) WritePong(message []byte) (int, error) {
+	if len(message) > MaxControlPayload {
+		return 0, errors.New("pong message too long, must be under 125 bytes")
+	}
+	return tx.writepingpong(FramePong, 0, message)
+}
+
+// WritePing writes a ping message over the Tx.
 func (tx *TxBuffered) WritePing(mask uint32, message []byte) (int, error) {
 	if len(message) > MaxControlPayload {
 		return 0, errors.New("ping message too long, must be under 125 bytes")
@@ -185,9 +223,13 @@ func (tx *TxBuffered) WritePing(mask uint32, message []byte) (int, error) {
 	if mask == 0 {
 		return 0, errors.New("pings require a non-zero mask")
 	}
+	return tx.writepingpong(FramePing, mask, message)
+}
+
+func (tx *TxBuffered) writepingpong(frame FrameType, mask uint32, message []byte) (int, error) {
 	tx.buf.Reset()
 	pl := uint64(len(message))
-	h := newHeader(FramePing, pl, mask, true)
+	h := newHeader(frame, pl, mask, true)
 	_, err := h.Encode(&tx.buf)
 	if err != nil {
 		return 0, err
