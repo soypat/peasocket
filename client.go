@@ -34,10 +34,11 @@ func NewClient(serverURL string, entropy func() uint32) *Client {
 		state: clientState{
 			closed:             true,
 			pendingPingOrClose: make([]byte, 0, MaxControlPayload),
-			pendingPong:        make([]byte, 0, MaxControlPayload),
+			expectedPong:       make([]byte, 0, MaxControlPayload),
+			closeErr:           net.ErrClosed,
 		},
 	}
-	rxc, txc := c.callbacks()
+	rxc, txc := c.state.callbacks()
 	c.Rx.RxCallbacks = rxc
 	c.Tx.TxCallbacks = txc
 	return c
@@ -56,6 +57,9 @@ type Client struct {
 
 // Dial not yet tested. Performs websocket handshake over net.Conn.
 func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
+	if !c.state.IsClosed() {
+		return errors.New("must first close existing connection before starting a new one")
+	}
 	secureWebsocketKey := c.secureKeyString()
 	req, err := c.makeRequest(context.Background(), secureWebsocketKey, overwriteHeaders)
 	if err != nil {
@@ -74,6 +78,8 @@ func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
 	}
 	c.Tx.SetTxTransport(conn)
 	c.Rx.SetRxTransport(conn)
+	c.state.closeErr = nil
+	c.state.closed = false
 	return nil
 }
 
@@ -81,6 +87,9 @@ func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
 // the handshake failed. After a successful handshake the Client is ready to begin
 // communicating with the server via websocket protocol.
 func (c *Client) DialViaHTTPClient(ctx context.Context, overwriteHeaders http.Header) error {
+	if !c.state.IsClosed() {
+		return errors.New("must first close existing connection before starting a new one")
+	}
 	if ctx == nil {
 		return errors.New("nil context")
 	}
@@ -105,15 +114,22 @@ func (c *Client) DialViaHTTPClient(ctx context.Context, overwriteHeaders http.He
 	}
 	c.Tx.SetTxTransport(rwc)
 	c.Rx.SetRxTransport(rwc)
+	c.state.closeErr = nil
+	c.state.closed = false
 	return nil
 }
 
 // ReadNextFrame reads next frame in connection. Should be called in a loop
 func (c *Client) ReadNextFrame() error {
 	if c.state.IsClosed() {
-		return net.ErrClosed
+		return c.Err()
 	}
-	_, err := c.Rx.ReadNextFrame()
+	err := c.state.ReplyOutstandingFrames(&c.Tx)
+	if err != nil {
+		c.CloseConn(err)
+		return err
+	}
+	_, err = c.Rx.ReadNextFrame()
 	return err
 }
 
@@ -121,6 +137,13 @@ func (c *Client) ReadNextFrame() error {
 // This message may have been fragmented over the wire.
 func (c *Client) NextMessageReader() (io.Reader, error) {
 	return c.state.NextMessage()
+}
+
+// Err returns the error that closed the connection.
+func (c *Client) Err() error {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	return c.state.closeErr
 }
 
 // makeRequest creates the HTTP handshake required to initiate a websocket connection
@@ -167,14 +190,12 @@ func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, ove
 }
 
 // CloseConn closes the underlying transport without sending websocket frames.
-func (c *Client) CloseConn() error {
+func (c *Client) CloseConn(err error) error {
 	w := c.Tx.trp
 	if c.state.IsClosed() {
 		return errors.New("no websocket connection to close")
 	}
-	c.state.mu.Lock()
-	c.state.closed = true
-	c.state.mu.Unlock()
+	c.state.CloseConn(err)
 	return w.Close()
 }
 
@@ -184,14 +205,11 @@ func (c *Client) CloseWebsocket(status StatusCode, reason string) error {
 	if c.state.IsClosed() {
 		return errors.New("no websocket connection to close")
 	}
-
 	_, err := c.Tx.WriteClose(c.entropy(), status, []byte(reason))
 	if err != nil {
 		return err
 	}
-	c.state.mu.Lock()
-	c.state.closed = true
-	c.state.mu.Unlock()
+	c.state.CloseConn(nil)
 	return nil
 }
 
@@ -248,68 +266,6 @@ func (c *Client) secureKey() [16]byte {
 	return *(*[4 * u32size]byte)(unsafe.Pointer(&k32))
 }
 
-// TODO(soypat): add this to callbacks.
-func (c *Client) callbacks() (RxCallbacks, TxCallbacks) {
-	return RxCallbacks{
-			OnMessage: func(rx *Rx, message io.Reader) error {
-				c.state.mu.Lock()
-				defer c.state.mu.Unlock()
-				n, err := io.Copy(&c.state.rbuf, message)
-				if err != nil {
-					c.state.currentMessageSize = 0
-					return err
-				}
-				c.state.currentMessageSize += uint64(n)
-				if rx.LastReceivedHeader.Fin() {
-					c.state.messageSizes = append(c.state.messageSizes, c.state.currentMessageSize)
-					c.state.currentMessageSize = 0
-				}
-				return nil
-			},
-			OnCtl: func(rx *Rx, payload io.Reader) (err error) {
-				op := rx.LastReceivedHeader.FrameType()
-				c.state.mu.Lock()
-				defer c.state.mu.Unlock()
-				var n int
-				switch op {
-				case FramePing:
-					n, err = readFull(payload, c.state.pendingPingOrClose[:MaxControlPayload])
-					if err != nil {
-						break
-					}
-					// Replaces pending ping with new ping.
-					c.state.pendingPingOrClose = c.state.pendingPingOrClose[:n]
-
-				case FramePong:
-					n, err = readFull(payload, c.state.pendingPingOrClose[:MaxControlPayload])
-					if err != nil {
-						break
-					}
-					c.state.pendingPong = c.state.pendingPingOrClose[:n]
-
-				case FrameClose:
-					c.state.closed = true
-					n, err = readFull(payload, c.state.pendingPingOrClose[:MaxControlPayload])
-					if err != nil {
-						break
-					}
-					// Replaces pending ping with new ping.
-					c.state.pendingPingOrClose = c.state.pendingPingOrClose[:n]
-				default:
-					panic("unknown control FrameType") // This should be unreachable.
-				}
-				return err
-			},
-			OnError: func(rx *Rx, err error) {
-				c.CloseConn()
-			},
-		}, TxCallbacks{
-			OnError: func(tx *TxBuffered, err error) {
-				c.CloseConn()
-			},
-		}
-}
-
 // clientState stores the persisting state of a websocket client connection.
 // Since this state is shared between frames it is protected by a mutex so that
 // the Client implementation is concurrent-safe.
@@ -318,11 +274,79 @@ type clientState struct {
 	rbuf               bytes.Buffer
 	currentMessageSize uint64
 	// unused as of yet.
-	messageSizes []uint64
-	// These two slices point to buf*
+	messageSizes       []uint64
 	pendingPingOrClose []byte
-	pendingPong        []byte
+	expectedPong       []byte
 	closed             bool
+	closeErr           error
+}
+
+// TODO(soypat): add this to callbacks.
+func (state *clientState) callbacks() (RxCallbacks, TxCallbacks) {
+	return RxCallbacks{
+			OnMessage: func(rx *Rx, message io.Reader) error {
+				state.mu.Lock()
+				defer state.mu.Unlock()
+				if state.closed {
+					return state.closeErr
+				}
+				n, err := io.Copy(&state.rbuf, message)
+				if err != nil {
+					state.currentMessageSize = 0
+					return err
+				}
+				state.currentMessageSize += uint64(n)
+				if rx.LastReceivedHeader.Fin() {
+					state.messageSizes = append(state.messageSizes, state.currentMessageSize)
+					state.currentMessageSize = 0
+				}
+				return nil
+			},
+			OnCtl: func(rx *Rx, payload io.Reader) (err error) {
+				op := rx.LastReceivedHeader.FrameType()
+				state.mu.Lock()
+				defer state.mu.Unlock()
+				if state.closed {
+					return state.closeErr
+				}
+				var n int
+				switch op {
+				case FramePing:
+					n, err = readFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					if err != nil {
+						break
+					}
+					// Replaces pending ping with new ping.
+					state.pendingPingOrClose = state.pendingPingOrClose[:n]
+
+				case FramePong:
+					n, err = readFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					if err != nil {
+						break
+					}
+					state.expectedPong = state.pendingPingOrClose[:n]
+
+				case FrameClose:
+					state.closed = true
+					n, err = readFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					if err != nil {
+						break
+					}
+					// Replaces pending ping with new ping.
+					state.pendingPingOrClose = state.pendingPingOrClose[:n]
+				default:
+					panic("unknown control FrameType") // This should be unreachable.
+				}
+				return err
+			},
+			OnError: func(rx *Rx, err error) {
+				state.CloseConn(err)
+			},
+		}, TxCallbacks{
+			OnError: func(tx *TxBuffered, err error) {
+				state.CloseConn(err)
+			},
+		}
 }
 
 func (cs *clientState) PendingAction() bool {
@@ -353,13 +377,6 @@ func (cs *clientState) Buffered() int {
 	return cs.rbuf.Len()
 }
 
-// func (cs *clientState) ReadRx(b []byte) (int, error) {
-// 	cs.mu.Lock()
-// 	defer cs.mu.Unlock()
-
-// 	n, err := cs.rbuf.Read(b)
-// }
-
 func (cs *clientState) NextMessage() (io.Reader, error) {
 	buffered := cs.Buffered()
 	if buffered == 0 || len(cs.messageSizes) == 0 {
@@ -378,4 +395,28 @@ func (cs *clientState) NextMessage() (io.Reader, error) {
 		panic(err) // should be unreachable.
 	}
 	return &newbuf, nil
+}
+
+func (state *clientState) CloseConn(err error) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed {
+		return
+	}
+	state.closed = true
+	state.closeErr = err
+}
+
+func (state *clientState) ReplyOutstandingFrames(tx *TxBuffered) error {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed || (len(state.pendingPingOrClose) == 0) {
+		return nil // Nothing to do.
+	}
+	_, err := tx.WritePong(state.pendingPingOrClose)
+	state.pendingPingOrClose = state.pendingPingOrClose[:0]
+	if err != nil {
+		err = fmt.Errorf("failed while responding pong to incoming ping: %w", err)
+	}
+	return err
 }
