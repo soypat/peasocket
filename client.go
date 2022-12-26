@@ -365,6 +365,8 @@ func (cs *clientState) NextMessage() (io.Reader, error) {
 	if buffered == 0 || len(cs.messageSizes) == 0 {
 		return nil, errors.New("no messages in buffer")
 	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	size := cs.messageSizes[0]
 	cs.messageSizes = cs.messageSizes[1:]
 	if len(cs.messageSizes) == 0 {
