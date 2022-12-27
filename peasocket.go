@@ -136,7 +136,7 @@ func DecodeHeader(r io.Reader) (Header, int, error) {
 	}
 	if masked {
 		var buf [4]byte
-		ngot, err := readFull(r, buf[:4])
+		ngot, err := io.ReadFull(r, buf[:4])
 		n += ngot
 		if err != nil {
 			return Header{}, n, err
@@ -163,10 +163,10 @@ func decodePayloadLength(r io.Reader) (v uint64, masked bool, n int, err error) 
 	var ngot int
 	switch buf[0] {
 	case 126:
-		ngot, err = readFull(r, buf[0:2])
+		ngot, err = io.ReadFull(r, buf[0:2])
 		v = uint64(binary.BigEndian.Uint16(buf[:2]))
 	case 127:
-		ngot, err = readFull(r, buf[:8])
+		ngot, err = io.ReadFull(r, buf[:8])
 		v = binary.BigEndian.Uint64(buf[:8])
 	default:
 		return uint64(buf[0]), masked, n, nil

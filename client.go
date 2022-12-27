@@ -269,7 +269,7 @@ func validateServerResponse(resp *http.Response, secureWebsocketKey string) erro
 
 func defaultEntropy() uint32 {
 	var output [4]byte
-	_, err := readFull(rand.Reader, output[:])
+	_, err := io.ReadFull(rand.Reader, output[:])
 	if err != nil {
 		panic(err)
 	}
@@ -355,7 +355,7 @@ func (state *clientState) callbacks() (RxCallbacks, TxCallbacks) {
 				var n int
 				switch op {
 				case FramePing:
-					n, err = readFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, state.pendingPingOrClose[:MaxControlPayload])
 					if err != nil {
 						break
 					}
@@ -363,14 +363,14 @@ func (state *clientState) callbacks() (RxCallbacks, TxCallbacks) {
 					state.pendingPingOrClose = state.pendingPingOrClose[:n]
 
 				case FramePong:
-					n, err = readFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, state.pendingPingOrClose[:MaxControlPayload])
 					if err != nil {
 						break
 					}
 					state.expectedPong = state.pendingPingOrClose[:n]
 
 				case FrameClose:
-					n, err = readFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, state.pendingPingOrClose[:MaxControlPayload])
 					if err != nil {
 						break
 					}
