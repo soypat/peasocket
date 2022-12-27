@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"io"
 	"log"
 	"net"
@@ -12,9 +13,12 @@ import (
 )
 
 func main() {
+	var wsURL string
+	flag.StringVar(&wsURL, "url", "ws://localhost:8080", "Websocket server URL to echo to (required).")
+	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	client := peasocket.NewClient("ws://localhost:8080", nil)
+	client := peasocket.NewClient(wsURL, nil)
 	err := client.DialViaHTTPClient(ctx, nil)
 	if err != nil {
 		log.Fatal("while dialing:", err)
