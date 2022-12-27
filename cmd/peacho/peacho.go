@@ -37,17 +37,22 @@ func main() {
 			}
 		}
 	}()
-
+	// Exponential Backoff algorithm to not saturate
+	// the process with calls to NextMessageReader
+	// https://en.wikipedia.org/wiki/Exponential_backoff
+	exponentialBackoff := time.Duration(0)
 	for {
 		msg, err := client.NextMessageReader()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || client.Err() != nil {
 				log.Fatal("websocket closed:", client.Err())
 			}
-			// log.Println("no next message err:", err)
-			time.Sleep(500 * time.Millisecond)
+			exponentialBackoff |= 1 << 1
+			exponentialBackoff = minDuration(exponentialBackoff, 500*time.Millisecond)
+			time.Sleep(exponentialBackoff)
 			continue
 		}
+		exponentialBackoff = 0
 		b, err := io.ReadAll(msg)
 		if err != nil {
 			log.Fatal("while reading message:", err)
@@ -58,4 +63,11 @@ func main() {
 			log.Fatal("while echoing message:", err)
 		}
 	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -457,7 +457,7 @@ func (state *clientState) CloseConn(err error) {
 func (state *clientState) ReplyOutstandingFrames(tx *TxBuffered) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.closed || (len(state.pendingPingOrClose) == 0) {
+	if state.closed || len(state.pendingPingOrClose) == 0 {
 		return nil // Nothing to do.
 	}
 	_, err := tx.WritePong(state.pendingPingOrClose)
