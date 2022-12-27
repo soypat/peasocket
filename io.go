@@ -22,17 +22,6 @@ func encodeByte(w io.Writer, b byte) error {
 	return err
 }
 
-func decodeByte(r io.Reader) (value byte, err error) {
-	var vbuf [1]byte
-	n, err := r.Read(vbuf[:])
-	if err != nil && n == 1 && errors.Is(err, io.EOF) {
-		err = nil // Byte was read successfully albeit with an EOF.
-	} else if n == 0 {
-		err = errors.New("unexpected 0 bytes read from buffer and no error returned")
-	}
-	return vbuf[0], err
-}
-
 func readFull(src io.Reader, dst []byte) (int, error) {
 	n, err := src.Read(dst)
 	if err == nil && n != len(dst) {

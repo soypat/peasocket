@@ -116,7 +116,12 @@ func newHeader(op FrameType, payload uint64, mask uint32, fin bool) Header {
 // DecodeHeader reads a header from the io.Reader. It assumes the first byte corresponds
 // to the header's first byte.
 func DecodeHeader(r io.Reader) (Header, int, error) {
-	firstByte, err := decodeByte(r)
+	var vbuf [1]byte
+	_, err := r.Read(vbuf[:])
+	if err != nil {
+		return Header{}, 0, err
+	}
+	firstByte := vbuf[0]
 	if err != nil {
 		return Header{}, 0, err
 	}

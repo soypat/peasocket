@@ -19,6 +19,12 @@ import (
 	"unsafe"
 )
 
+// flag error for when server gracefully closes the websocket connection with a Close frame.
+var (
+	errServerGracefulClose = errors.New("server closure")
+	errClientGracefulClose = errors.New("client closure")
+)
+
 // NewClient creates a new Client ready to connect to a websocket enabled server.
 // serverURL can start with wss:// or ws:// to enable TLS (secure websocket protocol).
 // entropy is a function that returns randomized 32 bit integers from a high-entropy source.
@@ -46,8 +52,9 @@ func NewClient(serverURL string, entropy func() uint32) *Client {
 
 // Client is a client websocket implementation.
 type Client struct {
-	Rx        Rx
+	txlock    sync.Mutex
 	Tx        TxBuffered
+	Rx        Rx
 	serverURL string
 	// entropy is assured to be defined after the first websocket connection.
 	entropy func() uint32
@@ -124,7 +131,9 @@ func (c *Client) ReadNextFrame() error {
 	if c.state.IsClosed() {
 		return c.Err()
 	}
+	c.txlock.Lock()
 	err := c.state.ReplyOutstandingFrames(&c.Tx)
+	c.txlock.Unlock()
 	if err != nil {
 		c.CloseConn(err)
 		return err
@@ -139,10 +148,43 @@ func (c *Client) NextMessageReader() (io.Reader, error) {
 	return c.state.NextMessage()
 }
 
+// WriteMessage writes a binary message over the websocket connection.
+func (c *Client) WriteMessage(payload []byte) error {
+	c.txlock.Lock()
+	defer c.txlock.Unlock()
+	err := c.state.ReplyOutstandingFrames(&c.Tx)
+	if err != nil {
+		c.CloseConn(err)
+		return err
+	}
+	_, err = c.Tx.writeMessage(c.entropy(), payload, false)
+	return err
+}
+
+// WriteTextMessage writes a utf-8 message over the websocket connection.
+func (c *Client) WriteTextMessage(payload []byte) error {
+	c.txlock.Lock()
+	defer c.txlock.Unlock()
+	err := c.state.ReplyOutstandingFrames(&c.Tx)
+	if err != nil {
+		c.CloseConn(err)
+		return err
+	}
+	_, err = c.Tx.writeMessage(c.entropy(), payload, true)
+	return err
+}
+
 // Err returns the error that closed the connection.
+// It only returns an error while the connection is closed.
+// One can test if the server gracefully closed the connection with
+//
+//	errors.As(err, &peasocket.CloseErr{})
 func (c *Client) Err() error {
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
+	if c.state.closeErr == errServerGracefulClose {
+		return fmt.Errorf("server closed websocket: %w", c.state.makeCloseErr())
+	}
 	return c.state.closeErr
 }
 
@@ -190,6 +232,7 @@ func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, ove
 }
 
 // CloseConn closes the underlying transport without sending websocket frames.
+// If err is nil CloseConn will panic.
 func (c *Client) CloseConn(err error) error {
 	w := c.Tx.trp
 	if c.state.IsClosed() {
@@ -209,7 +252,7 @@ func (c *Client) CloseWebsocket(status StatusCode, reason string) error {
 	if err != nil {
 		return err
 	}
-	c.state.CloseConn(nil)
+	c.state.CloseConn(errClientGracefulClose)
 	return nil
 }
 
@@ -327,11 +370,12 @@ func (state *clientState) callbacks() (RxCallbacks, TxCallbacks) {
 					state.expectedPong = state.pendingPingOrClose[:n]
 
 				case FrameClose:
-					state.closed = true
 					n, err = readFull(payload, state.pendingPingOrClose[:MaxControlPayload])
 					if err != nil {
 						break
 					}
+					state.closed = true
+					state.closeErr = errServerGracefulClose
 					// Replaces pending ping with new ping.
 					state.pendingPingOrClose = state.pendingPingOrClose[:n]
 				default:
@@ -398,6 +442,9 @@ func (cs *clientState) NextMessage() (io.Reader, error) {
 }
 
 func (state *clientState) CloseConn(err error) {
+	if err == nil {
+		panic("close error cannot be nil")
+	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closed {
@@ -419,4 +466,23 @@ func (state *clientState) ReplyOutstandingFrames(tx *TxBuffered) error {
 		err = fmt.Errorf("failed while responding pong to incoming ping: %w", err)
 	}
 	return err
+}
+
+func (state *clientState) makeCloseErr() *CloseError {
+	if len(state.pendingPingOrClose) < 2 {
+		return &CloseError{Status: StatusNoStatusRcvd}
+	}
+	return &CloseError{
+		Status: StatusCode(binary.BigEndian.Uint16(state.pendingPingOrClose[:2])),
+		Reason: state.pendingPingOrClose[2:],
+	}
+}
+
+type CloseError struct {
+	Status StatusCode
+	Reason []byte
+}
+
+func (c *CloseError) Error() string {
+	return c.Status.String() + ": " + string(c.Reason)
 }

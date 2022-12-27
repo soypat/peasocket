@@ -48,8 +48,9 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 	var reader io.Reader = rx.trp
 	h, n, err := DecodeHeader(reader)
 	if err != nil {
-		if n > 0 {
-			rx.RxCallbacks.OnError(rx, err)
+		if n > 0 || errors.Is(err, io.EOF) {
+			// EOF means the connection is no longer usable, must close.
+			rx.handleErr(err)
 		}
 		return n, err
 	}
@@ -94,6 +95,8 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 	return n + int(h.PayloadLength-uint64(lr.N)), err
 }
 
+// handleErr is a convenience wrapper for RxCallbacks.OnError. If RxCallbacks.OnError
+// is not defined then handleErr just closes the connection.
 func (rx *Rx) handleErr(err error) {
 	if rx.RxCallbacks.OnError != nil {
 		rx.RxCallbacks.OnError(rx, err)
