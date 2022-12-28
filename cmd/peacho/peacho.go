@@ -18,7 +18,7 @@ func main() {
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	client := peasocket.NewClient(wsURL, nil)
+	client := peasocket.NewClient(wsURL, nil, nil)
 	err := client.DialViaHTTPClient(ctx, nil)
 	if err != nil {
 		log.Fatal("while dialing:", err)

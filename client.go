@@ -28,38 +28,44 @@ var (
 // NewClient creates a new Client ready to connect to a websocket enabled server.
 // serverURL can start with wss:// or ws:// to enable TLS (secure websocket protocol).
 // entropy is a function that returns randomized 32 bit integers from a high-entropy source.
+// userBuffer will be used as scratch space to copy messages.
+//
 // If entropy is nil then a default will be used.
-func NewClient(serverURL string, entropy func() uint32) *Client {
+// If userBuffer is zero-lengthed one will be automatically allocated.
+func NewClient(serverURL string, userBuffer []byte, entropy func() uint32) *Client {
 	if entropy == nil {
 		entropy = defaultEntropy
 	}
+	if len(userBuffer) == 0 {
+		userBuffer = make([]byte, 32*1024)
+	}
 
 	c := &Client{
-		serverURL: serverURL,
+		ServerURL: serverURL,
 		entropy:   entropy,
-		state: clientState{
+		state: connState{
 			closed:             true,
 			pendingPingOrClose: make([]byte, 0, MaxControlPayload),
 			expectedPong:       make([]byte, 0, MaxControlPayload),
 			closeErr:           net.ErrClosed,
+			copyBuf:            userBuffer,
 		},
 	}
 	rxc, txc := c.state.callbacks()
-	c.Rx.RxCallbacks = rxc
-	c.Tx.TxCallbacks = txc
+	c.rx.RxCallbacks = rxc
+	c.tx.TxCallbacks = txc
 	return c
 }
 
 // Client is a client websocket implementation.
 type Client struct {
-	txlock    sync.Mutex
-	Tx        TxBuffered
-	Rx        Rx
-	serverURL string
-	// entropy is assured to be defined after the first websocket connection.
-	entropy func() uint32
+	txlock sync.Mutex
+	tx     TxBuffered
+	state  connState
+	rx     Rx
 
-	state clientState
+	ServerURL string
+	entropy   func() uint32
 }
 
 // Dial not yet tested. Performs websocket handshake over net.Conn.
@@ -83,8 +89,8 @@ func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
 	if err := validateServerResponse(resp, secureWebsocketKey); err != nil {
 		return err
 	}
-	c.Tx.SetTxTransport(conn)
-	c.Rx.SetRxTransport(conn)
+	c.tx.SetTxTransport(conn)
+	c.rx.SetRxTransport(conn)
 	c.state.closeErr = nil
 	c.state.closed = false
 	return nil
@@ -119,8 +125,8 @@ func (c *Client) DialViaHTTPClient(ctx context.Context, overwriteHeaders http.He
 	if !ok {
 		return fmt.Errorf("response body not an io.ReadWriteCloser: %T", resp.Body)
 	}
-	c.Tx.SetTxTransport(rwc)
-	c.Rx.SetRxTransport(rwc)
+	c.tx.SetTxTransport(rwc)
+	c.rx.SetRxTransport(rwc)
 	c.state.closeErr = nil
 	c.state.closed = false
 	return nil
@@ -132,13 +138,13 @@ func (c *Client) ReadNextFrame() error {
 		return c.Err()
 	}
 	c.txlock.Lock()
-	err := c.state.ReplyOutstandingFrames(&c.Tx)
+	err := c.state.ReplyOutstandingFrames(&c.tx)
 	c.txlock.Unlock()
 	if err != nil {
 		c.CloseConn(err)
 		return err
 	}
-	_, err = c.Rx.ReadNextFrame()
+	_, err = c.rx.ReadNextFrame()
 	return err
 }
 
@@ -152,12 +158,12 @@ func (c *Client) NextMessageReader() (io.Reader, error) {
 func (c *Client) WriteMessage(payload []byte) error {
 	c.txlock.Lock()
 	defer c.txlock.Unlock()
-	err := c.state.ReplyOutstandingFrames(&c.Tx)
+	err := c.state.ReplyOutstandingFrames(&c.tx)
 	if err != nil {
 		c.CloseConn(err)
 		return err
 	}
-	_, err = c.Tx.writeMessage(c.entropy(), payload, false)
+	_, err = c.tx.writeMessage(c.entropy(), payload, false)
 	return err
 }
 
@@ -165,12 +171,12 @@ func (c *Client) WriteMessage(payload []byte) error {
 func (c *Client) WriteTextMessage(payload []byte) error {
 	c.txlock.Lock()
 	defer c.txlock.Unlock()
-	err := c.state.ReplyOutstandingFrames(&c.Tx)
+	err := c.state.ReplyOutstandingFrames(&c.tx)
 	if err != nil {
 		c.CloseConn(err)
 		return err
 	}
-	_, err = c.Tx.writeMessage(c.entropy(), payload, true)
+	_, err = c.tx.writeMessage(c.entropy(), payload, true)
 	return err
 }
 
@@ -191,7 +197,7 @@ func (c *Client) Err() error {
 // makeRequest creates the HTTP handshake required to initiate a websocket connection
 // with a server.
 func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, overwriteHeaders http.Header) (*http.Request, error) {
-	u, err := url.Parse(c.serverURL)
+	u, err := url.Parse(c.ServerURL)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +240,7 @@ func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, ove
 // CloseConn closes the underlying transport without sending websocket frames.
 // If err is nil CloseConn will panic.
 func (c *Client) CloseConn(err error) error {
-	w := c.Tx.trp
+	w := c.tx.trp
 	if c.state.IsClosed() {
 		return errors.New("no websocket connection to close")
 	}
@@ -248,7 +254,7 @@ func (c *Client) CloseWebsocket(status StatusCode, reason string) error {
 	if c.state.IsClosed() {
 		return errors.New("no websocket connection to close")
 	}
-	_, err := c.Tx.WriteClose(c.entropy(), status, []byte(reason))
+	_, err := c.tx.WriteClose(c.entropy(), status, []byte(reason))
 	if err != nil {
 		return err
 	}
@@ -261,8 +267,9 @@ func validateServerResponse(resp *http.Response, secureWebsocketKey string) erro
 		return fmt.Errorf("expected %v switching protocol http status, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
 	}
 	if !strings.EqualFold(resp.Header.Get("Connection"), "Upgrade") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
-		!strings.EqualFold(resp.Header.Get("Sec-WebSocket-Accept"), serverProofOfReceipt(secureWebsocketKey)) {
-		return fmt.Errorf(`invalid header field(s) "Connection:Upgrade", "Upgrade:websocket" or "Sec-WebSocket-Accept":<secure concatenated hash>, got %v`, resp.Header)
+		!strings.EqualFold(resp.Header.Get("Sec-WebSocket-Accept"), serverProofOfReceipt(secureWebsocketKey)) ||
+		resp.Header.Get("Sec-Websocket-Version") != "13" {
+		return fmt.Errorf(`invalid header field(s) "Sec-Websocket-Version:13", "Connection:Upgrade", "Upgrade:websocket" or "Sec-WebSocket-Accept":<secure concatenated hash>, got %v`, resp.Header)
 	}
 	return nil
 }
@@ -309,10 +316,10 @@ func (c *Client) secureKey() [16]byte {
 	return *(*[4 * u32size]byte)(unsafe.Pointer(&k32))
 }
 
-// clientState stores the persisting state of a websocket client connection.
+// connState stores the persisting state of a websocket client connection.
 // Since this state is shared between frames it is protected by a mutex so that
 // the Client implementation is concurrent-safe.
-type clientState struct {
+type connState struct {
 	mu                 sync.Mutex
 	rbuf               bytes.Buffer
 	currentMessageSize uint64
@@ -320,92 +327,93 @@ type clientState struct {
 	messageSizes       []uint64
 	pendingPingOrClose []byte
 	expectedPong       []byte
+	copyBuf            []byte
 	closed             bool
 	closeErr           error
 }
 
 // TODO(soypat): add this to callbacks.
-func (state *clientState) callbacks() (RxCallbacks, TxCallbacks) {
+func (cs *connState) callbacks() (RxCallbacks, TxCallbacks) {
 	return RxCallbacks{
 			OnMessage: func(rx *Rx, message io.Reader) error {
-				state.mu.Lock()
-				defer state.mu.Unlock()
-				if state.closed {
-					return state.closeErr
+				cs.mu.Lock()
+				defer cs.mu.Unlock()
+				if cs.closed {
+					return cs.closeErr
 				}
-				n, err := io.Copy(&state.rbuf, message)
+				n, err := io.CopyBuffer(&cs.rbuf, message, cs.copyBuf)
 				if err != nil {
-					state.currentMessageSize = 0
+					cs.currentMessageSize = 0
 					return err
 				}
-				state.currentMessageSize += uint64(n)
+				cs.currentMessageSize += uint64(n)
 				if rx.LastReceivedHeader.Fin() {
-					state.messageSizes = append(state.messageSizes, state.currentMessageSize)
-					state.currentMessageSize = 0
+					cs.messageSizes = append(cs.messageSizes, cs.currentMessageSize)
+					cs.currentMessageSize = 0
 				}
 				return nil
 			},
 			OnCtl: func(rx *Rx, payload io.Reader) (err error) {
 				op := rx.LastReceivedHeader.FrameType()
-				state.mu.Lock()
-				defer state.mu.Unlock()
-				if state.closed {
-					return state.closeErr
+				cs.mu.Lock()
+				defer cs.mu.Unlock()
+				if cs.closed {
+					return cs.closeErr
 				}
 				var n int
 				switch op {
 				case FramePing:
-					n, err = io.ReadFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
 					if err != nil {
 						break
 					}
 					// Replaces pending ping with new ping.
-					state.pendingPingOrClose = state.pendingPingOrClose[:n]
+					cs.pendingPingOrClose = cs.pendingPingOrClose[:n]
 
 				case FramePong:
-					n, err = io.ReadFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
 					if err != nil {
 						break
 					}
-					state.expectedPong = state.pendingPingOrClose[:n]
+					cs.expectedPong = cs.pendingPingOrClose[:n]
 
 				case FrameClose:
-					n, err = io.ReadFull(payload, state.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
 					if err != nil {
 						break
 					}
-					state.closed = true
-					state.closeErr = errServerGracefulClose
+					cs.closed = true
+					cs.closeErr = errServerGracefulClose
 					// Replaces pending ping with new ping.
-					state.pendingPingOrClose = state.pendingPingOrClose[:n]
+					cs.pendingPingOrClose = cs.pendingPingOrClose[:n]
 				default:
 					panic("unknown control FrameType") // This should be unreachable.
 				}
 				return err
 			},
 			OnError: func(rx *Rx, err error) {
-				state.CloseConn(err)
+				cs.CloseConn(err)
 			},
 		}, TxCallbacks{
 			OnError: func(tx *TxBuffered, err error) {
-				state.CloseConn(err)
+				cs.CloseConn(err)
 			},
 		}
 }
 
-func (cs *clientState) PendingAction() bool {
+func (cs *connState) PendingAction() bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return !cs.closed && cs.pendingPingOrClose != nil
 }
 
-func (cs *clientState) IsClosed() bool {
+func (cs *connState) IsClosed() bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return cs.closed
 }
 
-func (cs *clientState) GetServerClosedReason() (_ StatusCode, reason []byte) {
+func (cs *connState) GetServerClosedReason() (_ StatusCode, reason []byte) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	if !cs.closed || len(cs.pendingPingOrClose) < 2 {
@@ -415,13 +423,13 @@ func (cs *clientState) GetServerClosedReason() (_ StatusCode, reason []byte) {
 	return sc, cs.pendingPingOrClose[2:]
 }
 
-func (cs *clientState) Buffered() int {
+func (cs *connState) Buffered() int {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return cs.rbuf.Len()
 }
 
-func (cs *clientState) NextMessage() (io.Reader, error) {
+func (cs *connState) NextMessage() (io.Reader, error) {
 	buffered := cs.Buffered()
 	if buffered == 0 || len(cs.messageSizes) == 0 {
 		return nil, errors.New("no messages in buffer")
@@ -434,14 +442,14 @@ func (cs *clientState) NextMessage() (io.Reader, error) {
 		cs.messageSizes = nil
 	}
 	var newbuf bytes.Buffer
-	_, err := io.Copy(&newbuf, io.LimitReader(&cs.rbuf, int64(size)))
+	_, err := io.CopyBuffer(&newbuf, io.LimitReader(&cs.rbuf, int64(size)), cs.copyBuf)
 	if err != nil {
 		panic(err) // should be unreachable.
 	}
 	return &newbuf, nil
 }
 
-func (state *clientState) CloseConn(err error) {
+func (state *connState) CloseConn(err error) {
 	if err == nil {
 		panic("close error cannot be nil")
 	}
@@ -454,7 +462,7 @@ func (state *clientState) CloseConn(err error) {
 	state.closeErr = err
 }
 
-func (state *clientState) ReplyOutstandingFrames(tx *TxBuffered) error {
+func (state *connState) ReplyOutstandingFrames(tx *TxBuffered) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closed || len(state.pendingPingOrClose) == 0 {
@@ -468,7 +476,7 @@ func (state *clientState) ReplyOutstandingFrames(tx *TxBuffered) error {
 	return err
 }
 
-func (state *clientState) makeCloseErr() *CloseError {
+func (state *connState) makeCloseErr() *CloseError {
 	if len(state.pendingPingOrClose) < 2 {
 		return &CloseError{Status: StatusNoStatusRcvd}
 	}
