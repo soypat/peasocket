@@ -1,9 +1,11 @@
 package peasocket
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"math/bits"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -43,6 +45,49 @@ func TestMask(t *testing.T) {
 		if string(got) != tc.expect {
 			t.Errorf("2STEP %v: key=%#X\n\tmessage:  %q\n\texpected: %q\n\tgot:      %q", tc.desc, tc.maskKey, tc.msg, tc.expect, got)
 		}
+	}
+}
+
+func TestFragment(t *testing.T) {
+	loopback := bytes.NewBuffer(nil)
+	tx := TxBuffered{}
+	rx := Rx{}
+	tx.SetTxTransport(&closer{Writer: loopback})
+	rx.SetRxTransport(io.NopCloser(loopback))
+	// e := defaultEntropy()
+	const message = "hello world!"
+	buffer := make([]byte, 24)
+	rd := strings.NewReader(message)
+	n, err := tx.WriteFragmentedMessage(0, rd, buffer)
+	wireLen := loopback.Len()
+	t.Log(loopback.String())
+	if err != nil {
+		t.Fatal(err)
+	} else if n != wireLen {
+		t.Error("returned bytes written of WriteFragmentedMessage not match written to loopback", n, wireLen)
+	}
+	done := false
+	var buf bytes.Buffer
+	rx.RxCallbacks.OnMessage = func(rx *Rx, message io.Reader) error {
+		done = rx.LastReceivedHeader.Fin()
+		buf.ReadFrom(message)
+		return nil
+	}
+	i := 0
+	for !done {
+		i++
+		n, err = rx.ReadNextFrame()
+		if err != nil || n != wireLen {
+			t.Error("error reading frame", n, wireLen, err)
+		}
+		if i > 8 {
+			t.Error("too many cycles, fin bit may have been incorrectly set")
+			break
+		}
+	}
+	got := buf.String()
+	if got != message {
+		t.Errorf("message garbled/incorrect after transferring with fragmentation\n\tgot:%q\n\twant:%q", got, message)
 	}
 }
 

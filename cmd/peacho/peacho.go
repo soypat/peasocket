@@ -47,7 +47,8 @@ func main() {
 			if errors.Is(err, net.ErrClosed) || client.Err() != nil {
 				log.Fatal("websocket closed:", client.Err())
 			}
-			exponentialBackoff |= 1 << 1
+			exponentialBackoff |= 1
+			exponentialBackoff <<= 1
 			exponentialBackoff = minDuration(exponentialBackoff, 500*time.Millisecond)
 			time.Sleep(exponentialBackoff)
 			continue

@@ -8,7 +8,8 @@ import (
 	"math"
 )
 
-// Header represents a [WebSocket frame header].
+// Header represents a [WebSocket frame header]. A header can occupy
+// 2 to 10 bytes on the wire depending on payload size and if content is masked.
 //
 //	0                   1                   2                   3
 //	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -184,53 +185,51 @@ func decodePayloadLength(r io.Reader) (v uint64, masked bool, n int, err error) 
 // Encode writes the websocket header to w as it would be sent over the wire.
 // It does not encode a payload.
 func (h *Header) Encode(w io.Writer) (int, error) {
-	err := encodeByte(w, h.firstByte)
+	var buf [MaxHeaderSize]byte
+	n, err := h.Put(buf[:])
 	if err != nil {
 		return 0, err
 	}
-	n, err := h.encodePayloadLength(w)
-	n++
-	if err != nil {
-		return n, err
+	return writeFull(w, buf[:n])
+}
+
+// Put encodes the header into the start of the byte slice.
+func (h *Header) Put(b []byte) (int, error) {
+	masked := h.IsMasked()
+	hsize := headerSizeFromMessageSize(int(h.PayloadLength), masked)
+	if len(b) < hsize {
+		return 0, io.ErrShortBuffer
 	}
-	if h.IsMasked() {
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:4], h.Mask)
-		ngot, err := writeFull(w, buf[:4])
-		n += ngot
-		if err != nil {
-			return n, err
-		}
+	b[0] = h.firstByte
+	n := h.putPayloadLength(b[1:]) + 1
+	if masked {
+		binary.BigEndian.PutUint32(b[n:], h.Mask)
+		n += 4
+	}
+	// TODO(soypat): Remove once tests cover all cases.
+	if hsize != n {
+		panic("bug in Header.Put")
 	}
 	return n, nil
 }
 
-func (h *Header) encodePayloadLength(w io.Writer) (n int, err error) {
-	var buf [8]byte
+// putPayloadLength needs buf to be of length 9.
+func (h *Header) putPayloadLength(buf []byte) (n int) {
 	mask := b2u8(h.IsMasked()) << 7
 	pl := h.PayloadLength
 	switch {
 	case pl < 126:
 		buf[0] = mask | byte(pl)
-		n, err = w.Write(buf[:1])
-
+		n = 1
 	case pl <= math.MaxUint16:
-		err = encodeByte(w, mask|126)
-		if err != nil {
-			return n, err
-		}
-		n++
-		binary.BigEndian.PutUint16(buf[:2], uint16(pl))
-		n, err = writeFull(w, buf[:2])
+		buf[0] = mask | 126
+		binary.BigEndian.PutUint16(buf[1:3], uint16(pl))
+		n = 3
 
 	default:
-		err = encodeByte(w, mask|127)
-		if err != nil {
-			return n, err
-		}
-		n++
-		binary.BigEndian.PutUint64(buf[:8], pl)
-		n, err = writeFull(w, buf[:8])
+		buf[0] = mask | 127
+		binary.BigEndian.PutUint64(buf[1:9], pl)
+		n = 9
 	}
-	return n, err
+	return n
 }

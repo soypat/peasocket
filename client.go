@@ -154,6 +154,19 @@ func (c *Client) NextMessageReader() (io.Reader, error) {
 	return c.state.NextMessage()
 }
 
+// WriteFragmentedMessage writes contents of r over the wire using the userBuffer
+// as scratch memory. This function does not allocate memory unless userBuffer is nil.
+func (c *Client) WriteFragmentedMessage(r io.Reader, userBuffer []byte) (int, error) {
+	c.txlock.Lock()
+	defer c.txlock.Unlock()
+	err := c.state.ReplyOutstandingFrames(&c.tx)
+	if err != nil {
+		c.CloseConn(err)
+		return 0, err
+	}
+	return c.tx.WriteFragmentedMessage(c.entropy(), r, userBuffer)
+}
+
 // WriteMessage writes a binary message over the websocket connection.
 func (c *Client) WriteMessage(payload []byte) error {
 	c.txlock.Lock()
@@ -267,8 +280,8 @@ func validateServerResponse(resp *http.Response, secureWebsocketKey string) erro
 		return fmt.Errorf("expected %v switching protocol http status, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
 	}
 	if !strings.EqualFold(resp.Header.Get("Connection"), "Upgrade") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
-		!strings.EqualFold(resp.Header.Get("Sec-WebSocket-Accept"), serverProofOfReceipt(secureWebsocketKey)) ||
-		resp.Header.Get("Sec-Websocket-Version") != "13" {
+		!strings.EqualFold(resp.Header.Get("Sec-WebSocket-Accept"), serverProofOfReceipt(secureWebsocketKey)) {
+		// resp.Header.Get("Sec-Websocket-Version") != "13" TODO(soypat): Add this once done testing since Nhooyr's library sometimes does not set this field.
 		return fmt.Errorf(`invalid header field(s) "Sec-Websocket-Version:13", "Connection:Upgrade", "Upgrade:websocket" or "Sec-WebSocket-Accept":<secure concatenated hash>, got %v`, resp.Header)
 	}
 	return nil

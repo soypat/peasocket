@@ -6,6 +6,7 @@
 Little websocket implementation
 
 ## Highlights
+* Zero allocations when fragmenting messages with `WriteFragmentedMessage`
 * Empty `go.mod` file.
 * Lockless base implementation
 * Dead-simple Client implementation

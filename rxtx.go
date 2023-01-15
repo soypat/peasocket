@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"math/bits"
 )
 
@@ -85,6 +86,9 @@ func (rx *Rx) ReadNextFrame() (int, error) {
 		for err == nil {
 			_, err = lr.Read(discard[:])
 		}
+		if err == io.EOF {
+			err = nil
+		}
 	}
 	if err == nil && lr.N != 0 {
 		err = errors.New("callback did not consume all bytes in frame")
@@ -164,6 +168,104 @@ func (tx *TxBuffered) writeMessage(mask uint32, payload []byte, isUTF8 bool) (in
 		tx.handleError(err)
 	}
 	return int(n), err
+}
+
+// WriteFragmentedMessage writes a fragmented message over websocket without allocating
+// memory. It reads the application message from payload and masks it with mask.
+func (tx *TxBuffered) WriteFragmentedMessage(mask uint32, payload io.Reader, userBuffer []byte) (int, error) {
+	if userBuffer == nil {
+		userBuffer = make([]byte, 1024)
+	}
+	if len(userBuffer) < 12 {
+		return 0, errors.New("buffer too small to write messages")
+	}
+	buflen := len(userBuffer)
+	masked := mask != 0
+	hSize := headerSizeFromTransportSize(buflen, masked)
+	maxMessageSize := uint64(buflen - hSize)
+
+	h := newHeader(FrameBinary, maxMessageSize, mask, false)
+
+	isEOF := false
+	var n int
+	for !isEOF {
+		h.Put(userBuffer)
+		if n == 0 {
+			h = newHeader(FrameContinuation, maxMessageSize, mask, false)
+		}
+		var nBuf int
+		for !isEOF && hSize+nBuf < len(userBuffer) {
+			ngot, err := payload.Read(userBuffer[hSize+nBuf:])
+			nBuf += ngot
+			isEOF = errors.Is(err, io.EOF)
+			if err != nil && !isEOF {
+				if n > 0 {
+					tx.handleError(err)
+				}
+				return n, err
+			}
+		}
+
+		if nBuf != int(maxMessageSize) {
+			h.PayloadLength = uint64(nBuf)
+			newHsize := headerSizeFromMessageSize(nBuf, masked)
+			// newHsize will always be lesser than hSize.
+			if newHsize != hSize {
+				for i := 0; i < nBuf; i++ {
+					userBuffer[newHsize+i] = userBuffer[hSize+i]
+				}
+				hSize = newHsize
+			}
+			h = newHeader(FrameContinuation, uint64(nBuf), mask, true)
+			h.Put(userBuffer)
+		}
+		maskWS(mask, userBuffer[hSize:hSize+nBuf])
+		ngot, err := tx.trp.Write(userBuffer[:hSize+nBuf])
+		n += ngot
+		if err != nil {
+			if n > 0 {
+				tx.handleError(err)
+			}
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func headerSizeFromMessageSize(mSize int, masked bool) (hSize int) {
+	maskSize := 0
+	if masked {
+		maskSize = 4
+	}
+	switch {
+	case mSize < 126:
+		// Smallest case, 2 byte header for application message under 126 bytes.
+		hSize = 2 + maskSize
+	case mSize <= math.MaxUint16:
+		// 2 bytes same as last case + 16bit payload length
+		hSize = (2 + 2) + maskSize
+	default:
+		hSize = (2 + 8) + maskSize
+	}
+	return hSize
+}
+
+func headerSizeFromTransportSize(tSize int, masked bool) (hSize int) {
+	maskSize := 0
+	if masked {
+		maskSize = 4
+	}
+	switch {
+	case tSize < 128-maskSize:
+		// Smallest case, 2 byte header for application message under 126 bytes.
+		hSize = 2 + maskSize
+	case tSize < math.MaxUint16-maskSize:
+		// 2 bytes same as last case + 16bit payload length
+		hSize = (2 + 2) + maskSize
+	default:
+		hSize = (2 + 8) + maskSize
+	}
+	return hSize
 }
 
 func (tx *TxBuffered) handleError(err error) {
@@ -276,6 +378,9 @@ func (mr *maskedReader) Read(b []byte) (int, error) {
 }
 
 func maskWS(key uint32, b []byte) uint32 {
+	if key == 0 {
+		return 0
+	}
 	for len(b) >= 4 {
 		v := binary.BigEndian.Uint32(b)
 		binary.BigEndian.PutUint32(b, v^key)

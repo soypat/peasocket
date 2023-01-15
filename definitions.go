@@ -7,6 +7,7 @@ const (
 	MaxControlPayload = 125
 	maxCloseReason    = MaxControlPayload - 2 // minus 2 to include 16 bit status code.
 	maxOpcode         = 0b1111
+	MaxHeaderSize     = 14
 )
 
 // [Non-control frames].

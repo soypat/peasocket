@@ -3,13 +3,48 @@ package peasocket
 import (
 	"bytes"
 	"io"
+	"math"
 	"testing"
 )
 
 // The go generate command below adds the fuzz corpus in the cache to git VCS.
 //
 //go:generate mv $(go env GOCACHE)/fuzz/github.com/soypat/peasocket/. testdata/fuzz/
-
+func FuzzHeaderPut(f *testing.F) {
+	testCases := []struct {
+		payloadLen uint64
+		maskKey    uint32
+	}{
+		{maskKey: 0, payloadLen: 20},
+		{maskKey: 0xa2312434, payloadLen: math.MaxUint16 + 20},
+		{maskKey: 0, payloadLen: math.MaxUint16 + 20},
+		{maskKey: 0xa2312434, payloadLen: 20},
+	}
+	for _, tc := range testCases {
+		f.Add(tc.payloadLen, tc.maskKey)
+	}
+	f.Fuzz(func(t *testing.T, payloadLen uint64, mask uint32) {
+		if payloadLen == 0 {
+			return
+		}
+		h := newHeader(FrameBinary, payloadLen, mask, false)
+		var buf [MaxHeaderSize]byte
+		n, err := h.Put(buf[:])
+		if err != nil {
+			panic(err)
+		}
+		hgot, n2, err := DecodeHeader(bytes.NewReader(buf[:n]))
+		if err != nil {
+			panic(err)
+		}
+		if n2 != n {
+			panic("lengths not equal over wire")
+		}
+		if h != hgot {
+			panic("encoding not match decoding")
+		}
+	})
+}
 func FuzzMaskedReader(f *testing.F) {
 	testCases := []struct {
 		data    []byte
@@ -67,11 +102,11 @@ func FuzzLoopbackMessage(f *testing.F) {
 	for _, tc := range testCases {
 		f.Add(tc.data, tc.maskKey)
 	}
-	f.Fuzz(func(t *testing.T, data []byte, maskKey uint32) {
-		if len(data) == 0 {
+	f.Fuzz(func(t *testing.T, dataCanon []byte, maskKey uint32) {
+		if len(dataCanon) == 0 {
 			return
 		}
-		datacp := append([]byte{}, data...)
+		datacp := append([]byte{}, dataCanon...)
 		var loop bytes.Buffer
 		tx := &TxBuffered{
 			trp: &closer{Writer: &loop},
@@ -98,10 +133,10 @@ func FuzzLoopbackMessage(f *testing.F) {
 			if uint64(len(b)) != pl {
 				t.Error("expected payload length not match read", len(b), pl)
 			}
-			if !bytes.Equal(b, data) {
-				dataMasked := append([]byte{}, data...)
+			if !bytes.Equal(b, dataCanon) {
+				dataMasked := append([]byte{}, dataCanon...)
 				maskWS(maskKey, dataMasked)
-				t.Errorf("data loopback failed for %v\ngot:\n\t%q\nexpect:\n\t%q\nexpect masked:\n\t%q", rx.LastReceivedHeader.String(), b, data, dataMasked)
+				t.Errorf("data loopback failed for %v\ngot:\n\t%q\nexpect:\n\t%q\nexpect masked:\n\t%q", rx.LastReceivedHeader.String(), b, dataCanon, dataMasked)
 			}
 			return nil
 		}
