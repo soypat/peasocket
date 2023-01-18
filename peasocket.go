@@ -96,14 +96,14 @@ func (h Header) String() string {
 
 // NewHeader creates a new websocket frame header. Set mask to 0 to disable masking
 // on the payload.
-func NewHeader(op FrameType, payload, mask int, fin bool) (Header, error) {
+func NewHeader(op FrameType, payload int, mask uint, fin bool) (Header, error) {
 	if op > 0b1111 {
 		return Header{}, errors.New("invalid opcode")
 	}
 	if payload < 0 {
 		return Header{}, errors.New("negative payload length")
 	}
-	if mask < 0 || mask > math.MaxUint32 {
+	if mask > math.MaxUint32 {
 		return Header{}, errors.New("negative mask or mask exceeds 32bit unsigned integer range")
 	}
 	return newHeader(op, uint64(payload), uint32(mask), fin), nil

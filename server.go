@@ -1,15 +1,26 @@
 package peasocket
 
 import (
-	"errors"
+	"bufio"
+	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 )
 
+const (
+	httpProto      = "HTTP/1.1"
+	httpProtoMinor = 1
+	httpProtoMajor = 1
+)
+
 type Server struct {
-	c *Client
+	rx    Rx
+	tx    TxBuffered
+	state connState
 }
 
 // NewClient creates a new Client ready to connect to a websocket enabled server.
@@ -20,34 +31,98 @@ func NewServer(rxCopyBuf []byte) *Server {
 	if len(rxCopyBuf) == 0 {
 		rxCopyBuf = make([]byte, 32*1024)
 	}
-	c := NewClient("", rxCopyBuf, defaultEntropy)
-	return &Server{c: c}
+	sv := &Server{
+		state: connState{
+			pendingPingOrClose: make([]byte, 0, MaxControlPayload),
+			expectedPong:       make([]byte, 0, MaxControlPayload),
+			closeErr:           errServerGracefulClose,
+			copyBuf:            rxCopyBuf,
+		},
+	}
+	return sv
 }
 
-func (sv *Server) Accept(w http.ResponseWriter, r *http.Request) error {
-	panic("not implemented yet")
-	if err := validateClientUpgrade(r); err != nil {
+func ListenAndServe(ctx context.Context, addr string, handler func(*Server)) error {
+	addrport, err := netip.ParseAddrPort(addr)
+	if err != nil {
 		return err
 	}
-	h, ok := w.(http.Hijacker)
-	if !ok {
-		return errors.New("response writer does not implement http.Hijacker interface")
+	listener, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(addrport))
+	if err != nil {
+		return err
 	}
-	_ = h
-	return nil
+	defer listener.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		err = listener.SetDeadline(dl)
+		if err != nil {
+			return err
+		}
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			continue
+		}
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		resp := http.Response{
+			Status:     http.StatusText(200),
+			StatusCode: 200,
+			Proto:      httpProto,
+			ProtoMajor: httpProtoMajor,
+			ProtoMinor: httpProtoMinor,
+			Request:    req,
+		}
+		if sc, err := validateClientUpgrade(req); err != nil {
+			resp.StatusCode = sc
+			resp.Status = err.Error()
+			resp.Write(conn)
+			conn.Close()
+			continue
+		}
+		resp.Header, _ = makeWSHeader(nil)
+		resp.Write(conn)
+		go func() {
+
+			sv := NewServer(make([]byte, 1024))
+			sv.rx.SetRxTransport(conn)
+			sv.tx.SetTxTransport(conn)
+			sv.state.closeErr = nil
+			defer conn.Close()
+			handler(sv)
+		}()
+	}
 }
 
-func validateClientUpgrade(r *http.Request) error {
+// func (sv *Server) AcceptHTTP(w http.ResponseWriter, r *http.Request) error {
+// 	if _, err := validateClientUpgrade(r); err != nil {
+// 		return err
+// 	}
+// 	h, ok := w.(http.Hijacker)
+// 	if !ok {
+// 		return errors.New("response writer does not implement http.Hijacker interface")
+// 	}
+// 	_ = h
+// 	return nil
+// }
+
+func validateClientUpgrade(r *http.Request) (int, error) {
 	challenge := r.Header.Get("Sec-Websocket-Key")
 	if challenge == "" || !strings.EqualFold(r.Header.Get("Connection"), "upgrade") ||
 		!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") ||
 		r.Header.Get("Sec-Websocket-Version") != "13" {
-		return fmt.Errorf(`invalid header field(s) "Sec-Websocket-Version:13" "Connection:Upgrade", "Upgrade:websocket" or "Sec-WebSocket-Accept":<secure concatenated hash>, got %v`, r.Header)
+		return 500, fmt.Errorf(`invalid header field(s) "Sec-Websocket-Version:13" "Connection:Upgrade", "Upgrade:websocket" or "Sec-WebSocket-Accept":<secure concatenated hash>, got %v`, r.Header)
 	}
 	if !checkSameOrigin(r) {
-		return fmt.Errorf("request origin denied: Host=%q, Origin=%q", r.Host, r.Header.Get("Origin"))
+		return 500, fmt.Errorf("request origin denied: Host=%q, Origin=%q", r.Host, r.Header.Get("Origin"))
 	}
-	return nil
+	return 200, nil
 }
 
 func checkSameOrigin(r *http.Request) bool {

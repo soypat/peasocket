@@ -44,10 +44,9 @@ func NewClient(serverURL string, userBuffer []byte, entropy func() uint32) *Clie
 		ServerURL: serverURL,
 		entropy:   entropy,
 		state: connState{
-			closed:             true,
 			pendingPingOrClose: make([]byte, 0, MaxControlPayload),
 			expectedPong:       make([]byte, 0, MaxControlPayload),
-			closeErr:           net.ErrClosed,
+			closeErr:           errClientGracefulClose,
 			copyBuf:            userBuffer,
 		},
 	}
@@ -59,19 +58,27 @@ func NewClient(serverURL string, userBuffer []byte, entropy func() uint32) *Clie
 
 // Client is a client websocket implementation.
 type Client struct {
-	txlock sync.Mutex
-	tx     TxBuffered
-	state  connState
-	rx     Rx
-
+	txlock    sync.Mutex
+	tx        TxBuffered
+	state     connState
+	rx        Rx
 	ServerURL string
 	entropy   func() uint32
 }
 
 // Dial not yet tested. Performs websocket handshake over net.Conn.
-func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
+func (c *Client) Dial(ctx context.Context, overwriteHeaders http.Header) error {
 	if !c.state.IsClosed() {
 		return errors.New("must first close existing connection before starting a new one")
+	}
+
+	remoteAddr, err := net.ResolveTCPAddr("tcp", strings.TrimPrefix(c.ServerURL, "ws://"))
+	if err != nil {
+		return err
+	}
+	conn, err := net.DialTCP("tcp", nil, remoteAddr)
+	if err != nil {
+		return err
 	}
 	secureWebsocketKey := c.secureKeyString()
 	req, err := c.makeRequest(context.Background(), secureWebsocketKey, overwriteHeaders)
@@ -82,7 +89,7 @@ func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.ReadResponse(bufio.NewReaderSize(conn, 1024), req)
+	resp, err := http.ReadResponse(bufio.NewReaderSize(conn, 256), req)
 	if err != nil {
 		return err
 	}
@@ -92,7 +99,6 @@ func (c *Client) Dial(conn net.Conn, overwriteHeaders http.Header) error {
 	c.tx.SetTxTransport(conn)
 	c.rx.SetRxTransport(conn)
 	c.state.closeErr = nil
-	c.state.closed = false
 	return nil
 }
 
@@ -128,7 +134,6 @@ func (c *Client) DialViaHTTPClient(ctx context.Context, overwriteHeaders http.He
 	c.tx.SetTxTransport(rwc)
 	c.rx.SetRxTransport(rwc)
 	c.state.closeErr = nil
-	c.state.closed = false
 	return nil
 }
 
@@ -227,26 +232,19 @@ func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, ove
 	req := &http.Request{
 		Method:     http.MethodGet,
 		URL:        u,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
+		Proto:      httpProto,
+		ProtoMajor: httpProtoMajor,
+		ProtoMinor: httpProtoMinor,
 		Header:     make(http.Header),
 		Host:       u.Host,
 	}
 	req = req.WithContext(ctx)
-	req.Header["Upgrade"] = []string{"websocket"}
-	req.Header["Connection"] = []string{"Upgrade"}
-	req.Header["Sec-WebSocket-Version"] = []string{"13"}
-	for k, v := range overwriteHeaders {
-		if len(v) == 0 {
-			return nil, errors.New("overwrite header key " + k + " empty")
-		}
-		req.Header.Set(k, v[0])
-		for _, v0 := range v[1:] {
-			req.Header.Add(k, v0)
-		}
+	hd, err := makeWSHeader(overwriteHeaders)
+	if err != nil {
+		return nil, err
 	}
-	req.Header["Sec-WebSocket-Key"] = []string{secureWebsocketKey}
+	hd["Sec-WebSocket-Key"] = []string{secureWebsocketKey}
+	req.Header = hd
 	return req, nil
 }
 
@@ -341,7 +339,6 @@ type connState struct {
 	pendingPingOrClose []byte
 	expectedPong       []byte
 	copyBuf            []byte
-	closed             bool
 	closeErr           error
 }
 
@@ -351,7 +348,7 @@ func (cs *connState) callbacks() (RxCallbacks, TxCallbacks) {
 			OnMessage: func(rx *Rx, message io.Reader) error {
 				cs.mu.Lock()
 				defer cs.mu.Unlock()
-				if cs.closed {
+				if cs.closeErr != nil {
 					return cs.closeErr
 				}
 				n, err := io.CopyBuffer(&cs.rbuf, message, cs.copyBuf)
@@ -370,7 +367,7 @@ func (cs *connState) callbacks() (RxCallbacks, TxCallbacks) {
 				op := rx.LastReceivedHeader.FrameType()
 				cs.mu.Lock()
 				defer cs.mu.Unlock()
-				if cs.closed {
+				if cs.closeErr != nil {
 					return cs.closeErr
 				}
 				var n int
@@ -395,7 +392,6 @@ func (cs *connState) callbacks() (RxCallbacks, TxCallbacks) {
 					if err != nil {
 						break
 					}
-					cs.closed = true
 					cs.closeErr = errServerGracefulClose
 					// Replaces pending ping with new ping.
 					cs.pendingPingOrClose = cs.pendingPingOrClose[:n]
@@ -417,22 +413,30 @@ func (cs *connState) callbacks() (RxCallbacks, TxCallbacks) {
 func (cs *connState) PendingAction() bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	return !cs.closed && cs.pendingPingOrClose != nil
+	return cs.closeErr == nil && cs.pendingPingOrClose != nil
+}
+
+func (cs *connState) Err() error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.closeErr
+}
+
+func (cs *connState) IsConnected() bool {
+	return cs.Err() == nil
 }
 
 func (cs *connState) IsClosed() bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	return cs.closed
+	return cs.Err() != nil
 }
 
-func (cs *connState) GetServerClosedReason() (_ StatusCode, reason []byte) {
+func (cs *connState) GetServerClosedReason() (sc StatusCode, reason []byte) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if !cs.closed || len(cs.pendingPingOrClose) < 2 {
+	if cs.closeErr == nil || len(cs.pendingPingOrClose) < 2 {
 		return 0, nil
 	}
-	sc := StatusCode(binary.BigEndian.Uint16(cs.pendingPingOrClose[:2]))
+	sc = StatusCode(binary.BigEndian.Uint16(cs.pendingPingOrClose[:2]))
 	return sc, cs.pendingPingOrClose[2:]
 }
 
@@ -468,17 +472,15 @@ func (state *connState) CloseConn(err error) {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.closed {
-		return
+	if state.closeErr == nil {
+		state.closeErr = err // Will set first error encountered after close.
 	}
-	state.closed = true
-	state.closeErr = err
 }
 
 func (state *connState) ReplyOutstandingFrames(tx *TxBuffered) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.closed || len(state.pendingPingOrClose) == 0 {
+	if state.closeErr != nil || len(state.pendingPingOrClose) == 0 {
 		return nil // Nothing to do.
 	}
 	_, err := tx.WritePong(state.pendingPingOrClose)
@@ -506,4 +508,21 @@ type CloseError struct {
 
 func (c *CloseError) Error() string {
 	return c.Status.String() + ": " + string(c.Reason)
+}
+
+func makeWSHeader(overwriteHeaders http.Header) (http.Header, error) {
+	header := make(http.Header)
+	header["Upgrade"] = []string{"websocket"}
+	header["Connection"] = []string{"Upgrade"}
+	header["Sec-WebSocket-Version"] = []string{"13"}
+	for k, v := range overwriteHeaders {
+		if len(v) == 0 {
+			return nil, errors.New("overwrite header key " + k + " empty")
+		}
+		header.Set(k, v[0])
+		for _, v0 := range v[1:] {
+			header.Add(k, v0)
+		}
+	}
+	return header, nil
 }
