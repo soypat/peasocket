@@ -10,6 +10,12 @@ const (
 	MaxHeaderSize     = 14
 )
 
+const (
+	httpProto      = "HTTP/1.1"
+	httpProtoMinor = 1
+	httpProtoMajor = 1
+)
+
 // [Non-control frames].
 //
 // [Non-control frames]: https://tools.ietf.org/html/rfc6455#section-11.8.
