@@ -13,12 +13,6 @@ import (
 	"strings"
 )
 
-const (
-	httpProto      = "HTTP/1.1"
-	httpProtoMinor = 1
-	httpProtoMajor = 1
-)
-
 type Server struct {
 	rx    Rx
 	tx    TxBuffered
