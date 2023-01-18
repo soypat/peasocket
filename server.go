@@ -27,10 +27,11 @@ func NewServer(rxCopyBuf []byte) *Server {
 	if len(rxCopyBuf) == 0 {
 		rxCopyBuf = make([]byte, 32*1024)
 	}
+	buf := make([]byte, 0, 2*MaxControlPayload)
 	sv := &Server{
 		state: connState{
-			pendingPingOrClose: make([]byte, 0, MaxControlPayload),
-			expectedPong:       make([]byte, 0, MaxControlPayload),
+			pendingPingOrClose: buf[0:0:MaxControlPayload],
+			expectedPong:       buf[MaxControlPayload : MaxControlPayload : 2*MaxControlPayload],
 			closeErr:           errServerGracefulClose,
 			copyBuf:            rxCopyBuf,
 		},

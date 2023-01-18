@@ -1,6 +1,7 @@
 package peasocket
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -232,4 +233,13 @@ func (h *Header) putPayloadLength(buf []byte) (n int) {
 		n = 9
 	}
 	return n
+}
+
+func defaultEntropy() uint32 {
+	var output [4]byte
+	_, err := io.ReadFull(rand.Reader, output[:])
+	if err != nil {
+		panic(err)
+	}
+	return binary.BigEndian.Uint32(output[:])
 }

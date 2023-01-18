@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -36,18 +35,22 @@ func NewClient(serverURL string, userBuffer []byte, entropy func() uint32) *Clie
 	if entropy == nil {
 		entropy = defaultEntropy
 	}
-	if len(userBuffer) == 0 {
+	L := len(userBuffer)
+	if userBuffer == nil {
 		userBuffer = make([]byte, 32*1024)
+	} else if L < MaxControlPayload*3 {
+		panic("user buffer length too short, must be at least 3*125")
 	}
-
+	ctl1 := userBuffer[0:0:MaxControlPayload]
+	ctl2 := userBuffer[MaxControlPayload : MaxControlPayload : 2*MaxControlPayload]
 	c := &Client{
 		ServerURL: serverURL,
 		entropy:   entropy,
 		state: connState{
-			pendingPingOrClose: make([]byte, 0, MaxControlPayload),
-			expectedPong:       make([]byte, 0, MaxControlPayload),
+			pendingPingOrClose: ctl1,
+			expectedPong:       ctl2,
 			closeErr:           errClientGracefulClose,
-			copyBuf:            userBuffer,
+			copyBuf:            userBuffer[2*MaxControlPayload:],
 		},
 	}
 	rxc, txc := c.state.callbacks()
@@ -137,6 +140,38 @@ func (c *Client) DialViaHTTPClient(ctx context.Context, overwriteHeaders http.He
 	return nil
 }
 
+// IsConnected returns true if the underlying transport of the websocket is ready to send/receive messages.
+// It is shorthand for c.Err() == nil.
+//
+// IsConnected is safe for concurrent use.
+func (c *Client) IsConnected() bool { return c.state.IsConnected() }
+
+// Err returns the error that closed the connection.
+// It only returns an error while the connection is closed.
+// One can test if the server gracefully closed the connection with
+//
+//	errors.As(err, &peasocket.CloseErr{})
+//
+// Err is safe for concurrent use.
+func (c *Client) Err() error {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	if c.state.closeErr == errServerGracefulClose {
+		return fmt.Errorf("server closed websocket: %w", c.state.makeCloseErr())
+	}
+	return c.state.closeErr
+}
+
+// BufferedMessages returns the amount of received messages N that are ready to be read
+// such that the user is guaranteed to not get an error calling NextMessageReader N times.
+//
+// BufferedMessages is safe for concurrent use.
+func (c *Client) BufferedMessages() int {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	return len(c.state.messageSizes)
+}
+
 // ReadNextFrame reads next frame in connection. Should be called in a loop
 func (c *Client) ReadNextFrame() error {
 	if c.state.IsClosed() {
@@ -198,20 +233,6 @@ func (c *Client) WriteTextMessage(payload []byte) error {
 	return err
 }
 
-// Err returns the error that closed the connection.
-// It only returns an error while the connection is closed.
-// One can test if the server gracefully closed the connection with
-//
-//	errors.As(err, &peasocket.CloseErr{})
-func (c *Client) Err() error {
-	c.state.mu.Lock()
-	defer c.state.mu.Unlock()
-	if c.state.closeErr == errServerGracefulClose {
-		return fmt.Errorf("server closed websocket: %w", c.state.makeCloseErr())
-	}
-	return c.state.closeErr
-}
-
 // makeRequest creates the HTTP handshake required to initiate a websocket connection
 // with a server.
 func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, overwriteHeaders http.Header) (*http.Request, error) {
@@ -252,24 +273,39 @@ func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, ove
 // If err is nil CloseConn will panic.
 func (c *Client) CloseConn(err error) error {
 	w := c.tx.trp
-	if c.state.IsClosed() {
-		return errors.New("no websocket connection to close")
+	r := c.rx.trp
+	if w != nil && r != nil {
+		c.state.CloseConn(err)
+		w.Close()
+		r.Close()
+		return nil
 	}
-	c.state.CloseConn(err)
-	return w.Close()
+	return errors.New("transport(s) nil, will not attempt to close. this may be a bug in peasocket")
 }
 
 // CloseWebsocket sends a close control frame over the websocket connection. Does
-// not close the underlying transport.
-func (c *Client) CloseWebsocket(status StatusCode, reason string) error {
+// not attempt to close the underlying transport.
+//
+// If
+func (c *Client) CloseWebsocket(err error) error {
+	if err == nil {
+		panic("nil error")
+	}
 	if c.state.IsClosed() {
 		return errors.New("no websocket connection to close")
 	}
-	_, err := c.tx.WriteClose(c.entropy(), status, []byte(reason))
+	closeErr, ok := err.(*CloseError)
+	if !ok {
+		closeErr.Status = StatusAbnormalClosure
+		closeErr.Reason = []byte(err.Error())
+	}
+	c.txlock.Lock()
+	defer c.txlock.Unlock()
+	_, err = c.tx.WriteClose(c.entropy(), closeErr.Status, closeErr.Reason)
 	if err != nil {
 		return err
 	}
-	c.state.CloseConn(errClientGracefulClose)
+	c.state.CloseConn(closeErr)
 	return nil
 }
 
@@ -283,15 +319,6 @@ func validateServerResponse(resp *http.Response, secureWebsocketKey string) erro
 		return fmt.Errorf(`invalid header field(s) "Sec-Websocket-Version:13", "Connection:Upgrade", "Upgrade:websocket" or "Sec-WebSocket-Accept":<secure concatenated hash>, got %v`, resp.Header)
 	}
 	return nil
-}
-
-func defaultEntropy() uint32 {
-	var output [4]byte
-	_, err := io.ReadFull(rand.Reader, output[:])
-	if err != nil {
-		panic(err)
-	}
-	return binary.BigEndian.Uint32(output[:])
 }
 
 // On the Sec-WebSocket-Key header field, which the server uses to

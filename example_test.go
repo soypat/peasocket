@@ -22,7 +22,10 @@ func ExampleClient_echo() {
 	if err != nil {
 		log.Fatal("while dialing:", err)
 	}
-	defer client.CloseWebsocket(peasocket.StatusGoingAway, "bye bye")
+	defer client.CloseWebsocket(&peasocket.CloseError{
+		Status: peasocket.StatusGoingAway,
+		Reason: []byte("bye bye"),
+	})
 	log.Printf("protocol switch success. prepare msg=%q", message)
 	go func() {
 		// This goroutine reads frames from network.

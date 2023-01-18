@@ -23,7 +23,10 @@ func main() {
 	if err != nil {
 		log.Fatal("while dialing:", err)
 	}
-	defer client.CloseWebsocket(peasocket.StatusGoingAway, "peacho finalized")
+	defer client.CloseWebsocket(&peasocket.CloseError{
+		Status: peasocket.StatusGoingAway,
+		Reason: []byte("peacho finalized"),
+	})
 	go func() {
 		for {
 			err := client.ReadNextFrame()
