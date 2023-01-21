@@ -67,6 +67,7 @@ func (cs *connState) callbacks(isClient bool) (RxCallbacks, TxCallbacks) {
 			},
 			OnCtl: func(rx *Rx, payload io.Reader) (err error) {
 				op := rx.LastReceivedHeader.FrameType()
+				plen := rx.LastReceivedHeader.PayloadLength
 				cs.mu.Lock()
 				defer cs.mu.Unlock()
 				if cs.closeErr != nil {
@@ -75,7 +76,7 @@ func (cs *connState) callbacks(isClient bool) (RxCallbacks, TxCallbacks) {
 				var n int
 				switch op {
 				case FramePing:
-					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:plen])
 					if err != nil {
 						break
 					}
@@ -84,7 +85,7 @@ func (cs *connState) callbacks(isClient bool) (RxCallbacks, TxCallbacks) {
 
 				case FramePong:
 					var pongBuf [MaxControlPayload]byte
-					n, err = io.ReadFull(payload, pongBuf[:])
+					n, err = io.ReadFull(payload, pongBuf[:plen])
 					if err != nil {
 						break
 					}
@@ -95,7 +96,7 @@ func (cs *connState) callbacks(isClient bool) (RxCallbacks, TxCallbacks) {
 					}
 
 				case FrameClose:
-					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
+					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:plen])
 					if err != nil {
 						break
 					}
@@ -123,7 +124,7 @@ func (cs *connState) callbacks(isClient bool) (RxCallbacks, TxCallbacks) {
 func (cs *connState) PendingAction() bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	return cs.closeErr == nil && cs.pendingPingOrClose != nil
+	return cs.closeErr == nil && len(cs.pendingPingOrClose) != 0
 }
 
 func (cs *connState) Err() error {
@@ -259,13 +260,13 @@ func (state *connState) CloseConn(err error) {
 	}
 }
 
-func (state *connState) ReplyOutstandingFrames(tx *TxBuffered) error {
+func (state *connState) ReplyOutstandingFrames(mask uint32, tx *TxBuffered) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closeErr != nil || len(state.pendingPingOrClose) == 0 {
 		return nil // Nothing to do.
 	}
-	_, err := tx.WritePong(state.pendingPingOrClose)
+	_, err := tx.WritePong(mask, state.pendingPingOrClose)
 	state.pendingPingOrClose = state.pendingPingOrClose[:0]
 	if err != nil {
 		err = fmt.Errorf("failed while responding pong to incoming ping: %w", err)

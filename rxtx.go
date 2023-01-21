@@ -314,11 +314,11 @@ func (tx *TxBuffered) WriteClose(mask uint32, status StatusCode, reason []byte) 
 }
 
 // WritePong writes a pong message over the Tx.
-func (tx *TxBuffered) WritePong(message []byte) (int, error) {
+func (tx *TxBuffered) WritePong(mask uint32, message []byte) (int, error) {
 	if len(message) > MaxControlPayload {
 		return 0, errors.New("pong message too long, must be under 125 bytes")
 	}
-	return tx.writepingpong(FramePong, 0, message)
+	return tx.writepingpong(FramePong, mask, message)
 }
 
 // WritePing writes a ping message over the Tx.

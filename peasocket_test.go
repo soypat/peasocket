@@ -2,11 +2,13 @@ package peasocket
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"math/bits"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -88,6 +90,50 @@ func TestFragment(t *testing.T) {
 	got := buf.String()
 	if got != message {
 		t.Errorf("message garbled/incorrect after transferring with fragmentation\n\tgot:%q\n\twant:%q", got, message)
+	}
+}
+
+func TestServerClientPingPong(t *testing.T) {
+	const waitTimes = 1e7 * time.Millisecond
+	svRxloopback := &transport{}
+	svTxloopback := &transport{}
+	sv := NewServer(make([]byte, 1024))
+	cl := NewClient("abc", make([]byte, 1024), nil)
+	sv.rx.trp = svRxloopback
+	sv.tx.trp = svTxloopback
+	sv.state.OnConnect()
+	cl.rx.trp = svTxloopback
+	cl.tx.trp = svRxloopback
+	cl.state.OnConnect()
+	mainCtx := context.Background()
+	svPingMessage := []byte("hello, buenos dias")
+	for i := 0; i < 5; i++ {
+		doneSv := false
+		go func() {
+			ctx, cancel := context.WithTimeout(mainCtx, waitTimes)
+			defer cancel()
+			err := sv.Ping(ctx, svPingMessage)
+			if err != nil {
+				panic(err)
+			}
+			doneSv = true
+		}()
+		time.Sleep(50 * time.Millisecond)
+		err := cl.ReadNextFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = sv.ReadNextFrame()
+		if err != nil {
+			t.Error("reading next frame", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if sv.state.PendingAction() {
+			t.Error("server pending action")
+		}
+		if !doneSv {
+			t.Fatalf("server did not get response rx=%q tx=%q", svRxloopback.buf.String(), svTxloopback.buf.String())
+		}
 	}
 }
 
@@ -224,4 +270,28 @@ type closer struct {
 func (c *closer) Close() error {
 	c.closed = true
 	return nil
+}
+
+type transport struct {
+	buf    bytes.Buffer
+	closed bool
+}
+
+func (c *transport) Close() error {
+	c.closed = true
+	return nil
+}
+
+func (c *transport) Read(b []byte) (int, error) {
+	if c.closed {
+		return 0, io.EOF
+	}
+	return c.buf.Read(b)
+}
+
+func (c *transport) Write(b []byte) (int, error) {
+	if c.closed {
+		return 0, io.EOF
+	}
+	return c.buf.Write(b)
 }

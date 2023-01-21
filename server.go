@@ -4,6 +4,7 @@ package peasocket
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -61,6 +62,23 @@ func NewServer(rxCopyBuf []byte) *Server {
 		},
 	}
 	sv.rx.RxCallbacks, sv.tx.TxCallbacks = sv.state.callbacks(false)
+	txOnError := sv.tx.TxCallbacks.OnError
+	sv.tx.TxCallbacks.OnError = func(tx *TxBuffered, err error) {
+		log.Printf("Tx.OnError(%s): %q", err, tx.buf.String())
+		txOnError(tx, err)
+	}
+	rxOnError := sv.rx.RxCallbacks.OnError
+	sv.rx.RxCallbacks.OnError = func(rx *Rx, err error) {
+		log.Printf("Rx.OnError %s: %s", rx.LastReceivedHeader.String(), err)
+		rxOnError(rx, err)
+	}
+	rxOnCtl := sv.rx.RxCallbacks.OnCtl
+	sv.rx.RxCallbacks.OnCtl = func(rx *Rx, payload io.Reader) error {
+		b, _ := io.ReadAll(payload)
+		log.Printf("Rx.OnCtl:%s: %q", rx.LastReceivedHeader.String(), string(b))
+		return rxOnCtl(rx, bytes.NewReader(b))
+	}
+
 	return sv
 }
 
@@ -75,7 +93,7 @@ func (sv *Server) ReadNextFrame() error {
 		return err
 	}
 	sv.muTx.Lock()
-	err = sv.state.ReplyOutstandingFrames(&sv.tx)
+	err = sv.state.ReplyOutstandingFrames(0, &sv.tx)
 	sv.muTx.Unlock()
 	if err != nil {
 		sv.CloseConn(err)
@@ -88,7 +106,10 @@ func (sv *Server) ReadNextFrame() error {
 // tcp.Listener on the argument address and begins listening for incoming websocket
 // client connections. On a succesful webosocket connection the handler is called
 // with a newly allocated Server instance.
-func ListenAndServe(ctx context.Context, address string, handler func(ctx context.Context, sv *Server)) error {
+func ListenAndServe(mainCtx context.Context, address string, handler func(ctx context.Context, sv *Server)) error {
+	var cancel func()
+	mainCtx, cancel = context.WithCancel(mainCtx)
+	defer cancel()
 	addrport, err := netip.ParseAddrPort(address)
 	if err != nil {
 		return err
@@ -98,19 +119,20 @@ func ListenAndServe(ctx context.Context, address string, handler func(ctx contex
 		return err
 	}
 	defer listener.Close()
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := mainCtx.Deadline(); ok {
 		err = listener.SetDeadline(dl)
 		if err != nil {
 			return err
 		}
 	}
+	var sendBuf bytes.Buffer
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := mainCtx.Err(); err != nil {
 			return err
 		}
 		conn, err := listener.AcceptTCP()
 		if err != nil {
-			continue
+			return err
 		}
 		req, err := http.ReadRequest(bufio.NewReader(conn))
 		if err != nil {
@@ -135,13 +157,20 @@ func ListenAndServe(ctx context.Context, address string, handler func(ctx contex
 		}
 		resp.Header, _ = makeWSHeader(nil)
 		resp.Header["Sec-WebSocket-Accept"] = []string{challengeAccept}
-		log.Println(resp)
-		resp.Write(conn)
+		resp.Write(&sendBuf)
+		_, err = sendBuf.WriteTo(conn)
+		sendBuf.Reset()
+		if err != nil {
+			conn.Close()
+			continue
+		}
 		go func() {
+			ctx, cancel := context.WithCancel(mainCtx)
+			defer cancel()
 			sv := NewServer(make([]byte, 1024))
 			sv.rx.SetRxTransport(conn)
 			sv.tx.SetTxTransport(conn)
-			sv.state.closeErr = nil
+			sv.state.OnConnect()
 			defer conn.Close()
 			log.Println("start handler")
 			handler(ctx, sv)
@@ -156,7 +185,7 @@ func (sv *Server) Ping(ctx context.Context, message []byte) error {
 	}
 	sv.muTx.Lock()
 
-	err := sv.state.ReplyOutstandingFrames(&sv.tx)
+	err := sv.state.ReplyOutstandingFrames(0, &sv.tx)
 	if err != nil {
 		sv.muTx.Unlock()
 		return err
@@ -244,7 +273,7 @@ func (sv *Server) WriteNextMessageTo(w io.Writer) (FrameType, int64, error) {
 func (c *Server) WriteFragmentedMessage(r io.Reader, userBuffer []byte) (int, error) {
 	c.muTx.Lock()
 	defer c.muTx.Unlock()
-	err := c.state.ReplyOutstandingFrames(&c.tx)
+	err := c.state.ReplyOutstandingFrames(0, &c.tx)
 	if err != nil {
 		c.CloseConn(err)
 		return 0, err

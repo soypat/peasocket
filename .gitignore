@@ -9,6 +9,9 @@
 .vscode
 # Test binary, built with `go test -c`
 *.test
+*.pprof
+*.prof
+*_bin
 
 # Coverage profile, `go test -coverprofile=coverage.cov`
 *.cov 

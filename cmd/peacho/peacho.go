@@ -54,20 +54,17 @@ func main() {
 	// Exponential Backoff algorithm to not saturate
 	// the process with calls to NextMessageReader
 	// https://en.wikipedia.org/wiki/Exponential_backoff
-	exponentialBackoff := time.Duration(0)
+	backoff := peasocket.ExponentialBackoff{MaxWait: 500 * time.Millisecond}
 	for {
 		msg, _, err := client.NextMessageReader()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || client.Err() != nil {
 				log.Fatal("websocket closed:", client.Err())
 			}
-			exponentialBackoff |= 1
-			exponentialBackoff <<= 1
-			exponentialBackoff = minDuration(exponentialBackoff, 500*time.Millisecond)
-			time.Sleep(exponentialBackoff)
+			backoff.Miss()
 			continue
 		}
-		exponentialBackoff = 0
+		backoff.Hit()
 		b, err := io.ReadAll(msg)
 		if err != nil {
 			log.Fatal("while reading message:", err)
@@ -78,11 +75,4 @@ func main() {
 			log.Fatal("while echoing message:", err)
 		}
 	}
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

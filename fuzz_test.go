@@ -106,21 +106,22 @@ func FuzzLoopbackMessage(f *testing.F) {
 		if len(dataCanon) == 0 {
 			return
 		}
+		trp := &transport{}
+		loopBuf := &trp.buf
 		datacp := append([]byte{}, dataCanon...)
-		var loop bytes.Buffer
 		tx := &TxBuffered{
-			trp: &closer{Writer: &loop},
+			trp: trp,
 		}
 		rx := Rx{
-			trp: io.NopCloser(&loop),
+			trp: trp,
 		}
 		written, err := tx.WriteMessage(maskKey, datacp)
 		if err != nil {
 			t.Fatal(err)
 		}
-		actualWritten := loop.Len()
+		actualWritten := loopBuf.Len()
 		if written != actualWritten {
-			t.Error("written bytes not match result of WriteMessage", written, loop.Len())
+			t.Error("written bytes not match result of WriteMessage", written, loopBuf.Len())
 		}
 		callbackCalled := false
 		rx.RxCallbacks.OnMessage = func(rx *Rx, r io.Reader) error {

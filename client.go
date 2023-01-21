@@ -188,7 +188,7 @@ func (c *Client) ReadNextFrame() error {
 		return err
 	}
 	c.muTx.Lock()
-	err = c.state.ReplyOutstandingFrames(&c.tx)
+	err = c.state.ReplyOutstandingFrames(c.entropy(), &c.tx)
 	c.muTx.Unlock()
 	if err != nil {
 		c.CloseConn(err)
@@ -215,7 +215,7 @@ func (c *Client) WriteNextMessageTo(w io.Writer) (FrameType, int64, error) {
 func (c *Client) WriteFragmentedMessage(r io.Reader, userBuffer []byte) (int, error) {
 	c.muTx.Lock()
 	defer c.muTx.Unlock()
-	err := c.state.ReplyOutstandingFrames(&c.tx)
+	err := c.state.ReplyOutstandingFrames(c.entropy(), &c.tx)
 	if err != nil {
 		c.CloseConn(err)
 		return 0, err
@@ -227,7 +227,7 @@ func (c *Client) WriteFragmentedMessage(r io.Reader, userBuffer []byte) (int, er
 func (c *Client) WriteMessage(payload []byte) error {
 	c.muTx.Lock()
 	defer c.muTx.Unlock()
-	err := c.state.ReplyOutstandingFrames(&c.tx)
+	err := c.state.ReplyOutstandingFrames(c.entropy(), &c.tx)
 	if err != nil {
 		c.CloseConn(err)
 		return err
@@ -240,7 +240,7 @@ func (c *Client) WriteMessage(payload []byte) error {
 func (c *Client) WriteTextMessage(payload []byte) error {
 	c.muTx.Lock()
 	defer c.muTx.Unlock()
-	err := c.state.ReplyOutstandingFrames(&c.tx)
+	err := c.state.ReplyOutstandingFrames(c.entropy(), &c.tx)
 	if err != nil {
 		c.CloseConn(err)
 		return err

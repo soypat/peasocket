@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"time"
 )
 
 // Header represents a [WebSocket frame header]. A header can occupy
@@ -254,4 +255,46 @@ func b2u8(b bool) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// ExponentialBackoff implements a [Exponential Backoff]
+// delay algorithm to prevent saturation network or processor
+// with failing tasks. An ExponentialBackoff with a non-zero MaxWait is ready for use.
+//
+// [Exponential Backoff]: https://en.wikipedia.org/wiki/Exponential_backoff
+type ExponentialBackoff struct {
+	// Wait defines the amount of time that Miss will wait on next call.
+	Wait time.Duration
+	// Maximum allowable value for Wait.
+	MaxWait time.Duration
+	// StartWait is the value that Wait takes after a call to Hit.
+	StartWait time.Duration
+	// ExpMinusOne is the shift performed on Wait minus one, so the zero value performs a shift of 1.
+	ExpMinusOne uint32
+}
+
+// Hit sets eb.Wait to the StartWait value.
+func (eb *ExponentialBackoff) Hit() {
+	if eb.MaxWait == 0 {
+		panic("MaxWait cannot be zero")
+	}
+	eb.Wait = eb.StartWait
+}
+
+// Miss sleeps for eb.Wait and increases eb.Wait exponentially.
+func (eb *ExponentialBackoff) Miss() {
+	const k = 1
+	wait := eb.Wait
+	maxWait := eb.MaxWait
+	exp := eb.ExpMinusOne + 1
+	if maxWait == 0 {
+		panic("MaxWait cannot be zero")
+	}
+	time.Sleep(wait)
+	wait |= time.Duration(k)
+	wait <<= exp
+	if wait > maxWait {
+		wait = maxWait
+	}
+	eb.Wait = wait
 }
