@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+var serverMaxBackoff = 500 * time.Millisecond
+
 // Server is a stateful websocket single-connection server implementation.
 // It is only partly safe for concurrent use.
 //
@@ -62,28 +64,11 @@ func NewServer(rxCopyBuf []byte) *Server {
 		},
 	}
 	sv.rx.RxCallbacks, sv.tx.TxCallbacks = sv.state.callbacks(false)
-	txOnError := sv.tx.TxCallbacks.OnError
-	sv.tx.TxCallbacks.OnError = func(tx *TxBuffered, err error) {
-		log.Printf("Tx.OnError(%s): %q", err, tx.buf.String())
-		txOnError(tx, err)
-	}
-	rxOnError := sv.rx.RxCallbacks.OnError
-	sv.rx.RxCallbacks.OnError = func(rx *Rx, err error) {
-		log.Printf("Rx.OnError %s: %s", rx.LastReceivedHeader.String(), err)
-		rxOnError(rx, err)
-	}
-	rxOnCtl := sv.rx.RxCallbacks.OnCtl
-	sv.rx.RxCallbacks.OnCtl = func(rx *Rx, payload io.Reader) error {
-		b, _ := io.ReadAll(payload)
-		log.Printf("Rx.OnCtl:%s: %q", rx.LastReceivedHeader.String(), string(b))
-		return rxOnCtl(rx, bytes.NewReader(b))
-	}
-
 	return sv
 }
 
 // ReadNextFrame reads next frame in connection and takes care of
-// incoming requests. Should be called in a loop
+// incoming requests. Should be called in a loop separate from write goroutines.
 func (sv *Server) ReadNextFrame() error {
 	if !sv.IsConnected() {
 		return sv.Err()
@@ -179,6 +164,8 @@ func ListenAndServe(mainCtx context.Context, address string, handler func(ctx co
 	}
 }
 
+// Ping blocks until a call to ReadNextFrame receives the corresponding Pong message.
+// Should be called in a goroutine separate to the Server Read goroutine.
 func (sv *Server) Ping(ctx context.Context, message []byte) error {
 	if !sv.IsConnected() {
 		return sv.Err()
@@ -198,6 +185,7 @@ func (sv *Server) Ping(ctx context.Context, message []byte) error {
 	if err != nil {
 		return err
 	}
+	backoff := ExponentialBackoff{MaxWait: serverMaxBackoff}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -208,7 +196,7 @@ func (sv *Server) Ping(ctx context.Context, message []byte) error {
 			break
 		}
 		sv.state.mu.Unlock()
-		time.Sleep(3 * time.Millisecond)
+		backoff.Miss()
 	}
 	return nil
 }
@@ -304,4 +292,40 @@ func checkSameOrigin(r *http.Request) bool {
 		return false
 	}
 	return strings.EqualFold(u.Host, r.Host)
+}
+
+// ENABLE_DEBUG_LOG will NOT stay in this package. It is a temporary
+// helper that is why the name is the way it is. Calling this function with enable
+// set to true without a enable=false call in between will cause duplicated log output.
+//
+// Deprecated: ENABLE_DEBUG_LOG is deprecated. Will not stay in package peasocket.
+func (sv *Server) ENABLE_DEBUG_LOG(enable bool) {
+	sv.state.mu.Lock()
+	defer sv.state.mu.Unlock()
+	if enable {
+		txOnError := sv.tx.TxCallbacks.OnError
+		sv.tx.TxCallbacks.OnError = func(tx *TxBuffered, err error) {
+			log.Printf("Tx.OnError(%s): %q", err, tx.buf.String())
+			txOnError(tx, err)
+		}
+		rxOnError := sv.rx.RxCallbacks.OnError
+		sv.rx.RxCallbacks.OnError = func(rx *Rx, err error) {
+			log.Printf("Rx.OnError %s: %s", rx.LastReceivedHeader.String(), err)
+			rxOnError(rx, err)
+		}
+		rxOnCtl := sv.rx.RxCallbacks.OnCtl
+		sv.rx.RxCallbacks.OnCtl = func(rx *Rx, payload io.Reader) error {
+			b, _ := io.ReadAll(payload)
+			log.Printf("Rx.OnCtl:%s: %q", rx.LastReceivedHeader.String(), string(b))
+			return rxOnCtl(rx, bytes.NewReader(b))
+		}
+		rxOnMsg := sv.rx.RxCallbacks.OnMessage
+		sv.rx.RxCallbacks.OnMessage = func(rx *Rx, message io.Reader) error {
+			b, _ := io.ReadAll(message)
+			log.Printf("Rx.OnMsg:%s: %q", rx.LastReceivedHeader.String(), string(b))
+			return rxOnMsg(rx, bytes.NewReader(b))
+		}
+	} else {
+		sv.rx.RxCallbacks, sv.tx.TxCallbacks = sv.state.callbacks(false)
+	}
 }

@@ -61,11 +61,6 @@ const (
 	// being replied to.
 	FramePong
 	// 11-16 are reserved for further control frames.
-
-	// This frame is reserved for connState.currentMessageOpcode when DiscardMessage
-	// is called. It signals that current fragmented message must be discarded until
-	// next new message is started.
-	peasocketDirtyReset = 15
 )
 
 // StatusCode represents a [WebSocket status code].

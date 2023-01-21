@@ -12,10 +12,9 @@ import (
 )
 
 var (
-	flagAddress         string
-	flagPingMessage     string
-	flagHeartbeatPeriod time.Duration
-	flagPingPeriod      time.Duration
+	flagAddress     string
+	flagPingMessage string
+	flagPingPeriod  time.Duration
 )
 
 func main() {
@@ -70,7 +69,6 @@ func main() {
 			} else {
 				backoff.Miss()
 			}
-
 		}
 	})
 	log.Println("server error:", err)
