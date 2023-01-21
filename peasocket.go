@@ -115,13 +115,17 @@ func newHeader(op FrameType, payload uint64, mask uint32, fin bool) Header {
 	return Header{firstByte: byte(op) | b2u8(fin)<<7, Mask: mask, PayloadLength: payload}
 }
 
+var (
+	errReadingFirstHeaderByte = errors.New("reading first byte in header")
+)
+
 // DecodeHeader reads a header from the io.Reader. It assumes the first byte corresponds
 // to the header's first byte.
 func DecodeHeader(r io.Reader) (Header, int, error) {
 	var vbuf [1]byte
 	_, err := r.Read(vbuf[:])
 	if err != nil {
-		return Header{}, 0, err
+		return Header{}, 0, fmt.Errorf("%s: %w", errReadingFirstHeaderByte, err)
 	}
 	firstByte := vbuf[0]
 	if err != nil {
@@ -242,4 +246,12 @@ func defaultEntropy() uint32 {
 		panic(err)
 	}
 	return binary.BigEndian.Uint32(output[:])
+}
+
+// b2u8 converts a bool to an uint8. true==1, false==0.
+func b2u8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
 }

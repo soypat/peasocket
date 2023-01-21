@@ -45,7 +45,7 @@ func ExampleClient_echo() {
 	for {
 		// This goroutine gets messages that have been read
 		// from the client's buffer and prints them.
-		msg, err := client.NextMessageReader()
+		msg, _, err := client.NextMessageReader()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				log.Fatal("websocket closed")

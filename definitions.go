@@ -1,5 +1,19 @@
 package peasocket
 
+// CloseError implements the error interface. It represents the websocket
+// Close Frame metadata that elaborates the reason for closure and a status code.
+type CloseError struct {
+	Status StatusCode
+	Reason []byte
+}
+
+// Error implements the error interface for CloseError. Example of output:
+//
+//	"going away: a user defined reason"
+func (c *CloseError) Error() string {
+	return c.Status.String() + ": " + string(c.Reason)
+}
+
 const (
 	// MaxControlPayload is the maximum length of a control frame payload as per [section 5.5].
 	//
@@ -47,6 +61,11 @@ const (
 	// being replied to.
 	FramePong
 	// 11-16 are reserved for further control frames.
+
+	// This frame is reserved for connState.currentMessageOpcode when DiscardMessage
+	// is called. It signals that current fragmented message must be discarded until
+	// next new message is started.
+	peasocketDirtyReset = 15
 )
 
 // StatusCode represents a [WebSocket status code].
@@ -93,6 +112,7 @@ const (
 	StatusTLSHandshake StatusCode = 1015
 )
 
+// String returns the lower-cased human readable representation of the websocket closure status code.
 func (sc StatusCode) String() (s string) {
 	switch sc {
 	case StatusNormalClosure:
@@ -133,6 +153,7 @@ func (sc StatusCode) String() (s string) {
 	return s
 }
 
+// String returns the lower-case human readable representation of the websocket op code.
 func (ft FrameType) String() (s string) {
 	switch ft {
 	case FrameContinuation:
@@ -158,3 +179,6 @@ func (ft FrameType) String() (s string) {
 	}
 	return s
 }
+
+// IsUTF8 returns true if the frame type is a websocket text frame.
+func (ft FrameType) IsUTF8() bool { return ft == FrameText }

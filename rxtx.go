@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"math/bits"
@@ -325,9 +326,6 @@ func (tx *TxBuffered) WritePing(mask uint32, message []byte) (int, error) {
 	if len(message) > MaxControlPayload {
 		return 0, errors.New("ping message too long, must be under 125 bytes")
 	}
-	if mask == 0 {
-		return 0, errors.New("pings require a non-zero mask")
-	}
 	return tx.writepingpong(FramePing, mask, message)
 }
 
@@ -395,4 +393,14 @@ func maskWS(key uint32, b []byte) uint32 {
 		}
 	}
 	return key
+}
+
+// writeFull is a convenience function to perform dst.Write and detect
+// bad writer implementations while at it.
+func writeFull(dst io.Writer, src []byte) (int, error) {
+	n, err := dst.Write(src)
+	if n != len(src) && err == nil {
+		err = fmt.Errorf("bad writer implementation %T", dst)
+	}
+	return n, err
 }

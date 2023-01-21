@@ -13,8 +13,12 @@ import (
 )
 
 func main() {
-	var wsURL string
+	var (
+		wsURL     string
+		keepGoing bool
+	)
 	flag.StringVar(&wsURL, "url", "ws://localhost:8080", "Websocket server URL to echo to (required).")
+	flag.BoolVar(&keepGoing, "k", true, "Retry until program terminated")
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -31,6 +35,13 @@ func main() {
 		for {
 			err := client.ReadNextFrame()
 			if client.Err() != nil {
+				if keepGoing {
+					log.Println("failure, retrying:", client.Err())
+					client.CloseConn(client.Err())
+					client.Dial(ctx, nil)
+					time.Sleep(time.Second)
+					continue
+				}
 				log.Println("connection closed, ending loop")
 				return
 			}
@@ -45,7 +56,7 @@ func main() {
 	// https://en.wikipedia.org/wiki/Exponential_backoff
 	exponentialBackoff := time.Duration(0)
 	for {
-		msg, err := client.NextMessageReader()
+		msg, _, err := client.NextMessageReader()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || client.Err() != nil {
 				log.Fatal("websocket closed:", client.Err())

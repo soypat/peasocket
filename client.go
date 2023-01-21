@@ -2,11 +2,9 @@ package peasocket
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +20,27 @@ import (
 var (
 	errServerGracefulClose = errors.New("server closure")
 	errClientGracefulClose = errors.New("client closure")
+	errUnexpectedPong      = errors.New("unexpected pong")
 )
+
+// Client is a client websocket implementation.
+//
+// Users should use Client in no more than two goroutines unless calling the
+// explicitly stated as concurrency safe methods i.e: Err, IsConnected.
+// These two goroutines should be separated by responsability:
+//   - The Read goroutine should call methods that read received messages
+//   - Write goroutine should call methods that write to the connection.
+//
+// Client automatically takes care of incoming Ping and Close frames during ReadNextFrame
+type Client struct {
+	// Tx mutex.
+	muTx      sync.Mutex
+	tx        TxBuffered
+	state     connState
+	rx        Rx
+	ServerURL string
+	entropy   func() uint32
+}
 
 // NewClient creates a new Client ready to connect to a websocket enabled server.
 // serverURL can start with wss:// or ws:// to enable TLS (secure websocket protocol).
@@ -53,20 +71,10 @@ func NewClient(serverURL string, userBuffer []byte, entropy func() uint32) *Clie
 			copyBuf:            userBuffer[2*MaxControlPayload:],
 		},
 	}
-	rxc, txc := c.state.callbacks()
+	rxc, txc := c.state.callbacks(true)
 	c.rx.RxCallbacks = rxc
 	c.tx.TxCallbacks = txc
 	return c
-}
-
-// Client is a client websocket implementation.
-type Client struct {
-	txlock    sync.Mutex
-	tx        TxBuffered
-	state     connState
-	rx        Rx
-	ServerURL string
-	entropy   func() uint32
 }
 
 // Dial not yet tested. Performs websocket handshake over net.Conn.
@@ -136,7 +144,7 @@ func (c *Client) DialViaHTTPClient(ctx context.Context, overwriteHeaders http.He
 	}
 	c.tx.SetTxTransport(rwc)
 	c.rx.SetRxTransport(rwc)
-	c.state.closeErr = nil
+	c.state.OnConnect()
 	return nil
 }
 
@@ -167,38 +175,46 @@ func (c *Client) Err() error {
 //
 // BufferedMessages is safe for concurrent use.
 func (c *Client) BufferedMessages() int {
-	c.state.mu.Lock()
-	defer c.state.mu.Unlock()
-	return len(c.state.messageSizes)
+	return c.state.BufferedMessages()
 }
 
 // ReadNextFrame reads next frame in connection. Should be called in a loop
 func (c *Client) ReadNextFrame() error {
-	if c.state.IsClosed() {
+	if !c.IsConnected() {
 		return c.Err()
 	}
-	c.txlock.Lock()
-	err := c.state.ReplyOutstandingFrames(&c.tx)
-	c.txlock.Unlock()
+	_, err := c.rx.ReadNextFrame()
+	if err != nil {
+		return err
+	}
+	c.muTx.Lock()
+	err = c.state.ReplyOutstandingFrames(&c.tx)
+	c.muTx.Unlock()
 	if err != nil {
 		c.CloseConn(err)
 		return err
 	}
-	_, err = c.rx.ReadNextFrame()
-	return err
+	return nil
 }
 
-// NextMessageReader returns a reader to a complete websocket message.
-// This message may have been fragmented over the wire.
-func (c *Client) NextMessageReader() (io.Reader, error) {
+// NextMessageReader returns a reader to a complete websocket message. It copies
+// the whole contents of the received message to a new buffer which is returned
+// to the caller.
+// The returned message may have been fragmented over the wire.
+func (c *Client) NextMessageReader() (io.Reader, FrameType, error) {
 	return c.state.NextMessage()
+}
+
+// WriteNextMessageTo writes the next received message in the queue to the argument writer.
+func (c *Client) WriteNextMessageTo(w io.Writer) (FrameType, int64, error) {
+	return c.state.WriteNextMessageTo(w)
 }
 
 // WriteFragmentedMessage writes contents of r over the wire using the userBuffer
 // as scratch memory. This function does not allocate memory unless userBuffer is nil.
 func (c *Client) WriteFragmentedMessage(r io.Reader, userBuffer []byte) (int, error) {
-	c.txlock.Lock()
-	defer c.txlock.Unlock()
+	c.muTx.Lock()
+	defer c.muTx.Unlock()
 	err := c.state.ReplyOutstandingFrames(&c.tx)
 	if err != nil {
 		c.CloseConn(err)
@@ -209,8 +225,8 @@ func (c *Client) WriteFragmentedMessage(r io.Reader, userBuffer []byte) (int, er
 
 // WriteMessage writes a binary message over the websocket connection.
 func (c *Client) WriteMessage(payload []byte) error {
-	c.txlock.Lock()
-	defer c.txlock.Unlock()
+	c.muTx.Lock()
+	defer c.muTx.Unlock()
 	err := c.state.ReplyOutstandingFrames(&c.tx)
 	if err != nil {
 		c.CloseConn(err)
@@ -222,8 +238,8 @@ func (c *Client) WriteMessage(payload []byte) error {
 
 // WriteTextMessage writes a utf-8 message over the websocket connection.
 func (c *Client) WriteTextMessage(payload []byte) error {
-	c.txlock.Lock()
-	defer c.txlock.Unlock()
+	c.muTx.Lock()
+	defer c.muTx.Unlock()
 	err := c.state.ReplyOutstandingFrames(&c.tx)
 	if err != nil {
 		c.CloseConn(err)
@@ -270,6 +286,7 @@ func (c *Client) makeRequest(ctx context.Context, secureWebsocketKey string, ove
 }
 
 // CloseConn closes the underlying transport without sending websocket frames.
+//
 // If err is nil CloseConn will panic.
 func (c *Client) CloseConn(err error) error {
 	w := c.tx.trp
@@ -285,28 +302,14 @@ func (c *Client) CloseConn(err error) error {
 
 // CloseWebsocket sends a close control frame over the websocket connection. Does
 // not attempt to close the underlying transport.
+// If CloseWebsocket received a [*CloseErr] type no memory allocation is performed and it's
+// status code and reason is used in the websocket close frame.
 //
-// If
+// If err is nil CloseWebsocket panics.
 func (c *Client) CloseWebsocket(err error) error {
-	if err == nil {
-		panic("nil error")
-	}
-	if c.state.IsClosed() {
-		return errors.New("no websocket connection to close")
-	}
-	closeErr, ok := err.(*CloseError)
-	if !ok {
-		closeErr.Status = StatusAbnormalClosure
-		closeErr.Reason = []byte(err.Error())
-	}
-	c.txlock.Lock()
-	defer c.txlock.Unlock()
-	_, err = c.tx.WriteClose(c.entropy(), closeErr.Status, closeErr.Reason)
-	if err != nil {
-		return err
-	}
-	c.state.CloseConn(closeErr)
-	return nil
+	c.muTx.Lock()
+	defer c.muTx.Unlock()
+	return c.state.CloseWebsocket(err, c.entropy(), &c.tx)
 }
 
 func validateServerResponse(resp *http.Response, secureWebsocketKey string) error {
@@ -352,189 +355,6 @@ func (c *Client) secureKey() [16]byte {
 	const u32size = unsafe.Sizeof(uint32(0))
 	k32 := [4]uint32{c.entropy(), c.entropy(), c.entropy(), c.entropy()}
 	return *(*[4 * u32size]byte)(unsafe.Pointer(&k32))
-}
-
-// connState stores the persisting state of a websocket client connection.
-// Since this state is shared between frames it is protected by a mutex so that
-// the Client implementation is concurrent-safe.
-type connState struct {
-	mu                 sync.Mutex
-	rbuf               bytes.Buffer
-	currentMessageSize uint64
-	// unused as of yet.
-	messageSizes       []uint64
-	pendingPingOrClose []byte
-	expectedPong       []byte
-	copyBuf            []byte
-	closeErr           error
-}
-
-// TODO(soypat): add this to callbacks.
-func (cs *connState) callbacks() (RxCallbacks, TxCallbacks) {
-	return RxCallbacks{
-			OnMessage: func(rx *Rx, message io.Reader) error {
-				cs.mu.Lock()
-				defer cs.mu.Unlock()
-				if cs.closeErr != nil {
-					return cs.closeErr
-				}
-				n, err := io.CopyBuffer(&cs.rbuf, message, cs.copyBuf)
-				if err != nil {
-					cs.currentMessageSize = 0
-					return err
-				}
-				cs.currentMessageSize += uint64(n)
-				if rx.LastReceivedHeader.Fin() {
-					cs.messageSizes = append(cs.messageSizes, cs.currentMessageSize)
-					cs.currentMessageSize = 0
-				}
-				return nil
-			},
-			OnCtl: func(rx *Rx, payload io.Reader) (err error) {
-				op := rx.LastReceivedHeader.FrameType()
-				cs.mu.Lock()
-				defer cs.mu.Unlock()
-				if cs.closeErr != nil {
-					return cs.closeErr
-				}
-				var n int
-				switch op {
-				case FramePing:
-					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
-					if err != nil {
-						break
-					}
-					// Replaces pending ping with new ping.
-					cs.pendingPingOrClose = cs.pendingPingOrClose[:n]
-
-				case FramePong:
-					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
-					if err != nil {
-						break
-					}
-					cs.expectedPong = cs.pendingPingOrClose[:n]
-
-				case FrameClose:
-					n, err = io.ReadFull(payload, cs.pendingPingOrClose[:MaxControlPayload])
-					if err != nil {
-						break
-					}
-					cs.closeErr = errServerGracefulClose
-					// Replaces pending ping with new ping.
-					cs.pendingPingOrClose = cs.pendingPingOrClose[:n]
-				default:
-					panic("unknown control FrameType") // This should be unreachable.
-				}
-				return err
-			},
-			OnError: func(rx *Rx, err error) {
-				cs.CloseConn(err)
-			},
-		}, TxCallbacks{
-			OnError: func(tx *TxBuffered, err error) {
-				cs.CloseConn(err)
-			},
-		}
-}
-
-func (cs *connState) PendingAction() bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	return cs.closeErr == nil && cs.pendingPingOrClose != nil
-}
-
-func (cs *connState) Err() error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	return cs.closeErr
-}
-
-func (cs *connState) IsConnected() bool {
-	return cs.Err() == nil
-}
-
-func (cs *connState) IsClosed() bool {
-	return cs.Err() != nil
-}
-
-func (cs *connState) GetServerClosedReason() (sc StatusCode, reason []byte) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if cs.closeErr == nil || len(cs.pendingPingOrClose) < 2 {
-		return 0, nil
-	}
-	sc = StatusCode(binary.BigEndian.Uint16(cs.pendingPingOrClose[:2]))
-	return sc, cs.pendingPingOrClose[2:]
-}
-
-func (cs *connState) Buffered() int {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	return cs.rbuf.Len()
-}
-
-func (cs *connState) NextMessage() (io.Reader, error) {
-	buffered := cs.Buffered()
-	if buffered == 0 || len(cs.messageSizes) == 0 {
-		return nil, errors.New("no messages in buffer")
-	}
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	size := cs.messageSizes[0]
-	cs.messageSizes = cs.messageSizes[1:]
-	if len(cs.messageSizes) == 0 {
-		cs.messageSizes = nil
-	}
-	var newbuf bytes.Buffer
-	_, err := io.CopyBuffer(&newbuf, io.LimitReader(&cs.rbuf, int64(size)), cs.copyBuf)
-	if err != nil {
-		panic(err) // should be unreachable.
-	}
-	return &newbuf, nil
-}
-
-func (state *connState) CloseConn(err error) {
-	if err == nil {
-		panic("close error cannot be nil")
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.closeErr == nil {
-		state.closeErr = err // Will set first error encountered after close.
-	}
-}
-
-func (state *connState) ReplyOutstandingFrames(tx *TxBuffered) error {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.closeErr != nil || len(state.pendingPingOrClose) == 0 {
-		return nil // Nothing to do.
-	}
-	_, err := tx.WritePong(state.pendingPingOrClose)
-	state.pendingPingOrClose = state.pendingPingOrClose[:0]
-	if err != nil {
-		err = fmt.Errorf("failed while responding pong to incoming ping: %w", err)
-	}
-	return err
-}
-
-func (state *connState) makeCloseErr() *CloseError {
-	if len(state.pendingPingOrClose) < 2 {
-		return &CloseError{Status: StatusNoStatusRcvd}
-	}
-	return &CloseError{
-		Status: StatusCode(binary.BigEndian.Uint16(state.pendingPingOrClose[:2])),
-		Reason: state.pendingPingOrClose[2:],
-	}
-}
-
-type CloseError struct {
-	Status StatusCode
-	Reason []byte
-}
-
-func (c *CloseError) Error() string {
-	return c.Status.String() + ": " + string(c.Reason)
 }
 
 func makeWSHeader(overwriteHeaders http.Header) (http.Header, error) {
