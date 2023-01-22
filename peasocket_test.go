@@ -119,11 +119,11 @@ func TestServerClientPingPong(t *testing.T) {
 			doneSv = true
 		}()
 		time.Sleep(50 * time.Millisecond)
-		err := cl.ReadNextFrame()
+		err := cl.HandleNextFrame()
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = sv.ReadNextFrame()
+		err = sv.HandleNextFrame()
 		if err != nil {
 			t.Error("reading next frame", err)
 		}
@@ -144,8 +144,7 @@ func TestServerClientPingPong(t *testing.T) {
 // The returned value is the correctly rotated key to
 // to continue to mask/unmask the message.
 //
-// It is optimized for LittleEndian and expects the key
-// to be in little endian.
+// It is optimized for LittleEndian architectures.
 //
 // See https://github.com/golang/go/issues/31586
 func mask(key uint32, b []byte) uint32 {

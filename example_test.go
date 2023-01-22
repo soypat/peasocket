@@ -30,7 +30,7 @@ func ExampleClient_echo() {
 	go func() {
 		// This goroutine reads frames from network.
 		for {
-			err := client.ReadNextFrame()
+			err := client.HandleNextFrame()
 			if errors.Is(err, net.ErrClosed) {
 				log.Println("connection closed, ending loop")
 				return
@@ -45,7 +45,7 @@ func ExampleClient_echo() {
 	for {
 		// This goroutine gets messages that have been read
 		// from the client's buffer and prints them.
-		msg, _, err := client.NextMessageReader()
+		msg, _, err := client.BufferedMessageReader()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				log.Fatal("websocket closed")

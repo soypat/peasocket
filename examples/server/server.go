@@ -40,7 +40,7 @@ func main() {
 		go func() {
 			backoff := peasocket.ExponentialBackoff{MaxWait: 500 * time.Millisecond}
 			for ctx.Err() == nil && sv.IsConnected() {
-				err := sv.ReadNextFrame()
+				err := sv.HandleNextFrame()
 				if err != nil {
 					log.Print("error reading next frame:", err)
 					backoff.Miss()

@@ -67,9 +67,9 @@ func NewServer(rxCopyBuf []byte) *Server {
 	return sv
 }
 
-// ReadNextFrame reads next frame in connection and takes care of
-// incoming requests. Should be called in a loop separate from write goroutines.
-func (sv *Server) ReadNextFrame() error {
+// HandleNextFrame reads next frame in connection and takes care of
+// control frame actions. Should be called in a loop separate from write goroutines.
+func (sv *Server) HandleNextFrame() error {
 	if !sv.IsConnected() {
 		return sv.Err()
 	}
@@ -91,6 +91,8 @@ func (sv *Server) ReadNextFrame() error {
 // tcp.Listener on the argument address and begins listening for incoming websocket
 // client connections. On a succesful webosocket connection the handler is called
 // with a newly allocated Server instance.
+//
+// TODO(soypat): Add a Listener type for vetting HTTP headers and whatnot. ListenAndServe should then use a default Listener.
 func ListenAndServe(mainCtx context.Context, address string, handler func(ctx context.Context, sv *Server)) error {
 	var cancel func()
 	mainCtx, cancel = context.WithCancel(mainCtx)

@@ -28,7 +28,7 @@ var (
 // Users should use Client in no more than two goroutines unless calling the
 // explicitly stated as concurrency safe methods i.e: Err, IsConnected.
 // These two goroutines should be separated by responsability:
-//   - The Read goroutine should call methods that read received messages
+//   - Read goroutine should call methods that read received messages
 //   - Write goroutine should call methods that write to the connection.
 //
 // Client automatically takes care of incoming Ping and Close frames during ReadNextFrame
@@ -178,8 +178,15 @@ func (c *Client) BufferedMessages() int {
 	return c.state.BufferedMessages()
 }
 
-// ReadNextFrame reads next frame in connection. Should be called in a loop
-func (c *Client) ReadNextFrame() error {
+// Buffered returns the amount of bytes ready to be read in the received message buffer.
+//
+// Buffered is safe for concurrent use.
+func (c *Client) Buffered() int {
+	return c.state.Buffered()
+}
+
+// HandleNextFrame reads next frame in connection. Should be called in a loop
+func (c *Client) HandleNextFrame() error {
 	if !c.IsConnected() {
 		return c.Err()
 	}
@@ -197,16 +204,16 @@ func (c *Client) ReadNextFrame() error {
 	return nil
 }
 
-// NextMessageReader returns a reader to a complete websocket message. It copies
+// BufferedMessageReader returns a reader to a complete websocket message. It copies
 // the whole contents of the received message to a new buffer which is returned
 // to the caller.
 // The returned message may have been fragmented over the wire.
-func (c *Client) NextMessageReader() (io.Reader, FrameType, error) {
+func (c *Client) BufferedMessageReader() (io.Reader, FrameType, error) {
 	return c.state.NextMessage()
 }
 
-// WriteNextMessageTo writes the next received message in the queue to the argument writer.
-func (c *Client) WriteNextMessageTo(w io.Writer) (FrameType, int64, error) {
+// WriteBufferedMessageTo writes the next received message in the queue to the argument writer.
+func (c *Client) WriteBufferedMessageTo(w io.Writer) (FrameType, int64, error) {
 	return c.state.WriteNextMessageTo(w)
 }
 

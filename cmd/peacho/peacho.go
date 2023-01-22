@@ -33,7 +33,7 @@ func main() {
 	})
 	go func() {
 		for {
-			err := client.ReadNextFrame()
+			err := client.HandleNextFrame()
 			if client.Err() != nil {
 				if keepGoing {
 					log.Println("failure, retrying:", client.Err())
@@ -56,7 +56,7 @@ func main() {
 	// https://en.wikipedia.org/wiki/Exponential_backoff
 	backoff := peasocket.ExponentialBackoff{MaxWait: 500 * time.Millisecond}
 	for {
-		msg, _, err := client.NextMessageReader()
+		msg, _, err := client.BufferedMessageReader()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || client.Err() != nil {
 				log.Fatal("websocket closed:", client.Err())
